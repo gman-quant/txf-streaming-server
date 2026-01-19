@@ -8,11 +8,12 @@ Architecture:
   - Optimization: Class encapsulation, lazy loading, error isolation
   - Asyncio Engine: uvloop (High-Performance Event Loop)
 Author: Garrett & Gemini
-Last Updated: 2025-11-29
+Last Updated: 2026-01-19
 """
 
 import sys
 import signal
+import time
 import asyncio
 import logging
 from decimal import Decimal
@@ -22,7 +23,6 @@ from typing import Optional
 import shioaji as sj
 from shioaji import TickFOPv1, BidAskFOPv1
 from confluent_kafka import Producer
-import uvloop
 
 # --- Local Imports ---
 from . import txf_data_pb2
@@ -202,11 +202,29 @@ class TxfStreamingService:
         logger.info("🔑 Logging into Shioaji...")
         self.api = sj.Shioaji(simulation=True)
         try:
-            self.api.login(api_key=SHIOAJI_API_KEY, secret_key=SHIOAJI_SECRET_KEY)
-            logger.info("✅ Login Success")
+            # contracts_timeout=10000: 登入時同步等待合約下載 (最多 10秒)
+            # 這能避免手動呼叫 fetch_contracts() 造成的 race condition (IndexError)
+            self.api.login(
+                api_key=SHIOAJI_API_KEY, 
+                secret_key=SHIOAJI_SECRET_KEY, 
+                contracts_timeout=10000
+            )
+            logger.info("✅ Login & Contracts Loaded")
         except Exception as e:
             logger.critical(f"❌ Login Failed: {e}")
+            # Prevent "Too Many Connections" by adding a safety delay
+            logger.debug("⏳ Waiting 5s for system stability...")
+            time.sleep(5)
+            # Ensure we send logout if possible to clean up "Ghost Connections"
+            self.shutdown()
             sys.exit(1)
+
+        # 在你的 start() 方法中，Login 成功後加入：
+        try:
+            usage = self.api.usage()
+            logger.info(f"📊 API Usage: Connections={usage.connections}, Traffic={usage.bytes/1024/1024:.2f}MB")
+        except:
+            pass
 
         # 綁定事件
         self.api.on_session_down(self._handle_session_down)
@@ -217,8 +235,40 @@ class TxfStreamingService:
         self.api.quote.set_on_bidask_fop_v1_callback(self.process_bidask)
 
         # 訂閱
+        logger.info("⏳ Looking for TXF contract...")
+        
+        # Robust Contract Lookup (Fix for AttributeError: 'StreamMultiContract' object has no attribute 'TXFR1')
+        contract = None
+        try:
+            # 修正存取路徑：Futures -> TXF -> TXFR1 (配合 fetch_contracts 使用)
+            contract = self.api.Contracts.Futures.TXF["TXFR1"] 
+            logger.info(f"✅ Found Near Month via direct lookup: {contract.name} ({contract.code})")
+        except (AttributeError, KeyError):
+            logger.warning("⚠️ 'TXFR1' direct lookup failed, attempting manual iteration...")
+            try:
+                # Fallback: Iterate and find the nearest monthly contract
+                # Filter for TXF contracts (excluding spreads which usually have different patterns or are handled separately)
+                txf_contracts = [
+                    c for c in self.api.Contracts.Futures.TXF 
+                    if c.code.startswith('TXF') and len(c.code) == 9  # Standard format e.g., TXF202602 (TXF + YYYYMM)
+                ]
+                # Sort by delivery date
+                txf_contracts.sort(key=lambda x: x.delivery_date)
+                
+                if txf_contracts:
+                    contract = txf_contracts[0]
+                    logger.info(f"✅ Found Near Month via fallback: {contract.name} ({contract.code})")
+                else:
+                    raise ValueError("No TXF contracts found in lookup.")
+            except Exception as e:
+                logger.critical(f"❌ Contract Lookup Failed: {e}")
+                sys.exit(1)
+
+        if not contract:
+            logger.critical("❌ Failed to identify TXF contract.")
+            sys.exit(1)
+
         logger.info("⏳ Subscribing to TXF...")
-        contract = self.api.Contracts.Futures.TXF.TXFR1
         self.api.quote.subscribe(contract, quote_type=sj.constant.QuoteType.Tick)
         self.api.quote.subscribe(contract, quote_type=sj.constant.QuoteType.BidAsk)
         logger.info(f"✅ Subscribed: {contract.name} ({contract.code})")
@@ -268,10 +318,17 @@ async def main():
 
 
 if __name__ == "__main__":
-    # --- 覆蓋標準 asyncio loop ---
-    # uvloop.install() 將 Python 內建的 asyncio 事件迴圈替換為 libuv 實現。
-    # 這是提升 I/O 調度效率的最高效益優化 (CPU cycles -> C code)。
-    uvloop.install()
+    # 跨平台相容性處理
+    try:
+        import uvloop
+        # --- 覆蓋標準 asyncio loop ---
+        # uvloop.install() 將 Python 內建的 asyncio 事件迴圈替換為 libuv 實現。
+        # 這是提升 I/O 調度效率的最高效益優化 (CPU cycles -> C code)。
+        uvloop.install()
+        logger.debug("✅ Linux detected: uvloop installed.")
+    except (ImportError, AttributeError):
+        # 在 Windows 上會抓到 ImportError
+        logger.debug("ℹ️ Windows/Other detected: using native asyncio loop.")
     
     try:
         # 啟動 Asyncio 執行環境，運行主協程 (Coroutine) main()

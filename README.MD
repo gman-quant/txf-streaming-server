@@ -40,8 +40,14 @@
 ```bash
 git clone https://github.com/gman-quant/txf-streaming-server.git
 cd txf-streaming-server
-python3 -m venv .venv
-. .venv/bin/activate
+
+python -m venv .venv
+
+. .venv/bin/activate # mac
+. .venv/Scripts/activate # win
+
+python.exe -m pip install --upgrade pip
+
 pip install -r requirements.txt
 ```
 
@@ -99,22 +105,48 @@ python -m src.txf_producer
 [Unit]
 Description=TXF Streaming Producer (Shioaji -> Kafka)
 Documentation=https://github.com/gman-quant/txf-streaming-server
-
 After=network-online.target kafka.service
 Requires=kafka.service
 PartOf=kafka.service
 
+# 若 1 分鐘內失敗超過 5 次，就暫停嘗試
+StartLimitIntervalSec=60s
+StartLimitBurst=5
+
 [Service]
-# 請填入實際的使用者與路徑
-User=
-Group=
-WorkingDirectory=
-ExecStart=
+# --- 執行權限與路徑 ---
+User=shioaji_svc
+Group=shioaji_svc
+WorkingDirectory=/home/shioaji_svc/txf-streaming-server
+ExecStart=/home/shioaji_svc/txf-streaming-server/.venv/bin/python -u -m src.txf_producer
+
+# --- 效能與優先權優化 ---
+# 提高 CPU 權重，降低延遲抖動
+Nice=-10
+# 提高 OOM 存活率 (值越低越不容易被系統砍掉)
+OOMScoreAdjust=-500
+# 增加可開啟的檔案/Socket 數量
+LimitNOFILE=65536
+
+# --- 預檢機制 ---
+# 等待 Kafka Port 就緒
+ExecStartPre=/bin/bash -c 'until echo > /dev/tcp/localhost/9092; do sleep 1; done'
+
+# --- 重啟策略 ---
 Restart=on-failure
-RestartSec=5s
+# 配合 Python 內 sleep(5)，形成穩健的重連冷卻
+RestartSec=25s
+
+# --- 關閉行為 ---
+# 確保 api.logout() 有足夠時間執行完成
+KillSignal=SIGINT
+TimeoutStopSec=30s
+
+# --- 環境變數 ---
 Environment=PYTHONUNBUFFERED=1
 Environment=LC_ALL=C.UTF-8
 Environment=LANG=C.UTF-8
+
 StandardOutput=journal
 StandardError=journal
 

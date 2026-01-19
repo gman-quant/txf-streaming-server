@@ -2,4 +2,4 @@ confluent-kafka
 dotenv
 grpcio-tools
 shioaji[speed]
-uvloop
+uvloop; sys_platform != 'win32'
