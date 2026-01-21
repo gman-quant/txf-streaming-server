@@ -41,14 +41,12 @@
 git clone https://github.com/gman-quant/txf-streaming-server.git
 cd txf-streaming-server
 
-python -m venv .venv
+uv venv
 
 . .venv/bin/activate # mac
 . .venv/Scripts/activate # win
 
-python.exe -m pip install --upgrade pip
-
-pip install -r requirements.txt
+uv pip install -r requirements.txt
 ```
 
 ### 2\. Protobuf 編譯
@@ -165,12 +163,12 @@ sudo crontab -e
 於文件最下方貼上以下內容：
 
 ```nano
-# --- Day Session (08:29 Start - 13:46 Stop) ---
-29 08 * * 1-5 /bin/systemctl start txf-producer.service
+# --- Day Session (08:40 Start - 13:46 Stop) ---
+40 08 * * 1-5 /bin/systemctl start txf-producer.service
 46 13 * * 1-5 /bin/systemctl stop txf-producer.service
 
-# --- Night Session (14:49 Start - 05:01 Stop) ---
-49 14 * * 1-5 /bin/systemctl start txf-producer.service
+# --- Night Session (14:55 Start - 05:01 Stop) ---
+55 14 * * 1-5 /bin/systemctl start txf-producer.service
 01 05 * * 2-6 /bin/systemctl stop txf-producer.service
 ```
 -----
