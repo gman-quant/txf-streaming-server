@@ -144,10 +144,8 @@ class TxfStreamingService:
                 value=tick.SerializeToString(),
                 on_delivery=self._delivery_report
             )
-            # 關鍵點：立即觸發 librdkafka 的回調函數檢查 (Delivery/Error)。
-            # 雖然頻繁 poll(0) 增加 CPU 負載，但確保極致延遲和 queue 不阻塞。
-            self.producer.poll(0)
-
+            # 修正：移除這行 self.producer.poll(0) 避免 GIL 阻塞，將其移至背景非同步執行緒
+            
         except Exception as e:
             logger.error(f"❌ Tick Process Error: {e}")
 
@@ -176,7 +174,7 @@ class TxfStreamingService:
                 value=ba.SerializeToString(),
                 on_delivery=self._delivery_report
             )
-            self.producer.poll(0)
+            # 修正：移除這行 self.producer.poll(0)
 
         except Exception as e:
             logger.error(f"❌ BidAsk Process Error: {e}")
@@ -315,8 +313,15 @@ async def main():
 
     logger.info("🟢 Service is running (Ctrl+C to stop)")
     
-    # 在這裡可以加入 Watchdog 邏輯 (如需要)
-    # asyncio.create_task(watchdog(service, stop_event))
+    # 建立背景輪詢 Task (專門處理 Kafka 回調，釋放主執行緒)
+    async def background_poll_loop():
+        while not stop_event.is_set():
+            if service.producer:
+                service.producer.poll(0)
+            await asyncio.sleep(0.1)  # 每 100 毫秒巡視一次即可
+            
+    asyncio.create_task(background_poll_loop())
+    logger.info("✅ Background Poll Task started.")
     
     await stop_event.wait()
     service.shutdown()
