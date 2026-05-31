@@ -90,7 +90,7 @@ class TxfStreamingService:
             'acks': '1',                           # 等待 Leader 確認，兼顧低延遲與防漏資料
             'linger.ms': 0,                        # 零延遲，有數據立刻發送
             'compression.type': 'none',            # [修改] 停用壓縮！區網頻寬富裕，拒絕消耗 CPU 計算壓縮
-            # 備註：librdkafka 預設已自動啟用 TCP_NODELAY (socket.nodelay)，無需且不可手動設定以防報錯
+            'socket.nagle.disable': True,          # [修改] 關閉 Nagle 演算法，網卡層零等待立即發射
 
             # --- 記憶體與佇列優化 ---
             'queue.buffering.max.kbytes': 131072,  # 128MB Buffer
