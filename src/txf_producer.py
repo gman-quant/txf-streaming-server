@@ -85,15 +85,20 @@ class TxfStreamingService:
         kafka_conf = {
             'bootstrap.servers': KAFKA_BOOTSTRAP_SERVERS,
             'client.id': 'txf-producer-hft',
-            # --- HFT 速度核心參數 ---
-            'acks': '0',                # 極速模式：Producer 不等待 Broker 確認，以追求最低延遲。
-            'linger.ms': 0,             # 零延遲：有數據立即發送，不等待批次累積 (Batching)。
-            'compression.type': 'lz4',  # 低 CPU 消耗壓縮：解壓最快，延遲最低。
-            # --------------------------
-            'queue.buffering.max.kbytes': 131072, # 128MB Buffer: 防止快市或網路抖動時記憶體溢出。
-            'batch.size': 262144,       # 256KB Batch: 雖然 linger=0，但瞬間大量寫入時仍為有效限制。
-            # 針對 TCP 網路層優化
-            'socket.send.buffer.bytes': 102400,
+
+            # --- HFT 速度核心參數（極限優化版） ---
+            'acks': '1',                           # 等待 Leader 確認，兼顧低延遲與防漏資料
+            'linger.ms': 0,                        # 零延遲，有數據立刻發送
+            'compression.type': 'none',            # [修改] 停用壓縮！區網頻寬富裕，拒絕消耗 CPU 計算壓縮
+            # 備註：librdkafka 預設已自動啟用 TCP_NODELAY (socket.nodelay)，無需且不可手動設定以防報錯
+
+            # --- 記憶體與佇列優化 ---
+            'queue.buffering.max.kbytes': 131072,  # 128MB Buffer
+            'batch.size': 262144,                  # 256KB Batch 限制
+            'delivery.report.only.error': True,    # [新增] 只回報錯誤，正常投遞不觸發 callback，省下 CPU 週期
+
+            # --- 針對區域網路高吞吐優化 ---
+            'socket.send.buffer.bytes': 1024000,   # [修改] 稍微加大發送緩衝（1MB），防止極端快市時網卡瞬間塞車
             'socket.receive.buffer.bytes': 102400,
         }
         try:
