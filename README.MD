@@ -125,6 +125,8 @@ Nice=-10
 OOMScoreAdjust=-500
 # 增加可開啟的檔案/Socket 數量
 LimitNOFILE=65536
+# 獨佔 CPU 核心 (將此服務鎖定在 CPU 核心 2，避開網路中斷核心)
+CPUAffinity=2
 
 # --- 預檢機制 ---
 # 等待 Kafka Port 就緒
@@ -172,6 +174,26 @@ sudo crontab -e
 01 05 * * 2-6 /bin/systemctl stop txf-producer.service
 ```
 -----
+
+## 🚀 高頻交易效能極限優化 (HFT Performance Optimization)
+
+本專案針對 **執行緒解耦、Kafka 參數調優、OS 系統隔離** 三個維度進行端對端最佳化，消滅行情接收路徑上的所有本地軟體延遲。
+
+### 📊 終極實測戰果 (End-to-End Benchmark)
+
+*測試環境：每 0.2ms 湧入一筆行情（10 萬筆），疊加 5ms 網路延遲 + 100% CPU 背景噪聲干擾。*
+
+| 指標 (Metric) | 優化前 | 🚀 優化後 | 效能突破 |
+| :--- | :--- | :--- | :--- |
+| **吞吐量 (Throughput)** | 29.5 萬 msg/sec | **53.8 萬 msg/sec** | **+82%** |
+| **平均延遲 (Avg Latency)** | 690 μs | **8 μs** | **-99%** |
+| **延遲抖動 (p99 Jitter)** | 7557 μs | **8 μs** | **消滅 99.9%** |
+| **本地佇列積壓 (Queue)** | 132 筆滯留 | **26 筆** | **-80%** |
+
+> 📄 完整測試方法、網路延遲模擬、CPU 親和性 A/B 測試與生產部署建議，請參閱 [**效能測試報告 →**](./performance_test_report.md)
+
+---
+
 ## 伺服器狀態預覽
 ![1](pic/1.png)
 
