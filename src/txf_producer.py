@@ -5,10 +5,11 @@ TXF Streaming Producer (Class-Based Optimized)
 Architecture:
   - Pattern: Event-Driven Producer
   - Core: Shioaji (Source) -> Protobuf (Serialize) -> Kafka (Sink)
+  - Routing: Dual-Topic Dispatch (TXFR1 -> txf-tick, TXFR2 -> txfr2-tick)
   - Optimization: Class encapsulation, lazy loading, error isolation
   - Asyncio Engine: uvloop (High-Performance Event Loop)
 Author: Garrett & Gemini
-Last Updated: 2026-01-19
+Last Updated: 2026-06-14
 """
 
 import sys
@@ -29,7 +30,7 @@ from . import txf_data_pb2
 from .config import (
     SHIOAJI_API_KEY, SHIOAJI_SECRET_KEY, 
     KAFKA_BOOTSTRAP_SERVERS, 
-    TICK_TOPIC, BIDASK_TOPIC
+    TICK_TOPIC, TICK_R2_TOPIC, BIDASK_TOPIC
 )
 
 # ==========================================
@@ -77,6 +78,8 @@ class TxfStreamingService:
     def __init__(self):
         self.api: Optional[sj.Shioaji] = None
         self.producer: Optional[Producer] = None
+        self.contract_r1 = None
+        self.contract_r2 = None
         self.running = False
         self._loop = None
 
@@ -138,8 +141,12 @@ class TxfStreamingService:
             tick.underlying_price = self._to_scaled_int(quote.underlying_price)
             tick.total_volume = int(quote.total_volume)
 
+            target_topic = TICK_TOPIC
+            if self.contract_r2 and quote.code == self.contract_r2.code:
+                target_topic = TICK_R2_TOPIC
+
             self.producer.produce(
-                TICK_TOPIC,
+                target_topic,
                 key=tick.code.encode('utf-8'),
                 value=tick.SerializeToString(),
                 on_delivery=self._delivery_report
@@ -238,43 +245,61 @@ class TxfStreamingService:
         self.api.quote.set_on_bidask_fop_v1_callback(self.process_bidask)
 
         # 訂閱
-        logger.info("⏳ Looking for TXF contract...")
+        logger.info("⏳ Looking for TXF contracts...")
         
         # Robust Contract Lookup (Fix for AttributeError: 'StreamMultiContract' object has no attribute 'TXFR1')
-        contract = None
         try:
-            # 修正存取路徑：Futures -> TXF -> TXFR1 (配合 fetch_contracts 使用)
-            contract = self.api.Contracts.Futures.TXF["TXFR1"] 
-            logger.info(f"✅ Found Near Month via direct lookup: {contract.name} ({contract.code})")
+            self.contract_r1 = self.api.Contracts.Futures.TXF["TXFR1"] 
+            logger.info(f"✅ Found Near Month via direct lookup: {self.contract_r1.name} ({self.contract_r1.code})")
         except (AttributeError, KeyError):
             logger.warning("⚠️ 'TXFR1' direct lookup failed, attempting manual iteration...")
             try:
-                # Fallback: Iterate and find the nearest monthly contract
-                # Filter for TXF contracts (excluding spreads which usually have different patterns or are handled separately)
                 txf_contracts = [
                     c for c in self.api.Contracts.Futures.TXF 
-                    if c.code.startswith('TXF') and len(c.code) == 9  # Standard format e.g., TXF202602 (TXF + YYYYMM)
+                    if c.code.startswith('TXF') and len(c.code) == 9
                 ]
-                # Sort by delivery date
                 txf_contracts.sort(key=lambda x: x.delivery_date)
                 
                 if txf_contracts:
-                    contract = txf_contracts[0]
-                    logger.info(f"✅ Found Near Month via fallback: {contract.name} ({contract.code})")
+                    self.contract_r1 = txf_contracts[0]
+                    if len(txf_contracts) > 1:
+                        self.contract_r2 = txf_contracts[1]
+                    logger.info(f"✅ Found Near Month via fallback: {self.contract_r1.name} ({self.contract_r1.code})")
                 else:
                     raise ValueError("No TXF contracts found in lookup.")
             except Exception as e:
                 logger.critical(f"❌ Contract Lookup Failed: {e}")
                 sys.exit(1)
 
-        if not contract:
+        if not self.contract_r1:
             logger.critical("❌ Failed to identify TXF contract.")
             sys.exit(1)
+            
+        try:
+            if not self.contract_r2:
+                self.contract_r2 = self.api.Contracts.Futures.TXF["TXFR2"]
+            logger.info(f"✅ Found Next Month: {self.contract_r2.name} ({self.contract_r2.code})")
+        except (AttributeError, KeyError):
+            logger.warning("⚠️ Could not find TXFR2 contract. Only R1 will be streamed.")
 
-        logger.info("⏳ Subscribing to TXF...")
-        self.api.quote.subscribe(contract, quote_type=sj.constant.QuoteType.Tick)
-        self.api.quote.subscribe(contract, quote_type=sj.constant.QuoteType.BidAsk)
-        logger.info(f"✅ Subscribed: {contract.name} ({contract.code})")
+        logger.info("⏳ Subscribing to TXF contracts...")
+        
+        # 顯示更詳細的合約資訊 (包含月份與實際代碼)
+        r1_desc = f"{self.contract_r1.name} ({self.contract_r1.code})"
+        if hasattr(self.contract_r1, 'delivery_month'):
+            r1_desc += f" [Delivery: {self.contract_r1.delivery_month}]"
+            
+        self.api.quote.subscribe(self.contract_r1, quote_type=sj.constant.QuoteType.Tick)
+        self.api.quote.subscribe(self.contract_r1, quote_type=sj.constant.QuoteType.BidAsk)
+        logger.info(f"✅ Subscribed R1 (Tick + BidAsk): {r1_desc}")
+        
+        if self.contract_r2:
+            r2_desc = f"{self.contract_r2.name} ({self.contract_r2.code})"
+            if hasattr(self.contract_r2, 'delivery_month'):
+                r2_desc += f" [Delivery: {self.contract_r2.delivery_month}]"
+                
+            self.api.quote.subscribe(self.contract_r2, quote_type=sj.constant.QuoteType.Tick)
+            logger.info(f"✅ Subscribed R2 (Tick only): {r2_desc}")
         
         self.running = True
 

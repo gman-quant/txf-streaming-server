@@ -33,3 +33,5 @@ logs/
 
 # Python bytecode cache 資料夾
 __pycache__/
+
+*.parquet
