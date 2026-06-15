@@ -142,7 +142,8 @@ class TxfStreamingService:
             tick.total_volume = int(quote.total_volume)
 
             target_topic = TICK_TOPIC
-            if self.contract_r2 and quote.code == self.contract_r2.code:
+            # 檢查 quote.code 是否為次月合約 (比對 code 或是 target_code，因為連續合約的代碼是 TXFR2 但收到的 tick 是 TXFG6)
+            if self.contract_r2 and quote.code in (self.contract_r2.code, getattr(self.contract_r2, "target_code", "")):
                 target_topic = TICK_R2_TOPIC
 
             self.producer.produce(
@@ -254,9 +255,10 @@ class TxfStreamingService:
         except (AttributeError, KeyError):
             logger.warning("⚠️ 'TXFR1' direct lookup failed, attempting manual iteration...")
             try:
+                # 排除 TXFR1/TXFR2 這種別名，找出實際帶有 target_code 的合約，或是過濾長度
                 txf_contracts = [
                     c for c in self.api.Contracts.Futures.TXF 
-                    if c.code.startswith('TXF') and len(c.code) == 9
+                    if c.code.startswith('TXF') and len(c.code) == 5 and not c.code.startswith('TXFR')
                 ]
                 txf_contracts.sort(key=lambda x: x.delivery_date)
                 
