@@ -76,8 +76,9 @@ SHIOAJI_SECRET_KEY=your_secret_key_here
 # -----------------------------------------------
 # Kafka Broker 範例: 192.168.1.10:9092 或 多個 broker 用逗號分隔
 KAFKA_BOOTSTRAP_SERVERS=kafka_broker_IP:9092
-# Topic 名稱範例: txf-tick, txf-bidask
+# Topic 名稱範例: txf-tick, txfr2-tick, txf-bidask(三個都必填,缺 TICK_R2_TOPIC 會讓每筆 R2 tick 發送失敗)
 TICK_TOPIC=txf-tick
+TICK_R2_TOPIC=txfr2-tick
 BIDASK_TOPIC=txf-bidask
 ```
 
