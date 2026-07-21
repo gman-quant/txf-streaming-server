@@ -1,0 +1,27 @@
+[Unit]
+Description=Apache Kafka Server
+Documentation=https://kafka.apache.org/documentation/
+Requires=network.target remote-fs.target
+After=network.target remote-fs.target
+
+# 【新增】當 kafka.service 啟動時，也「想要」啟動我們的橋接服務。
+# 使用 Wants (弱依賴) 比 Requires (強依賴) 更安全，
+# 因為橋接服務的失敗不應該影響到 Kafka 本身的啟動。
+Wants=shioaji_kafka_bridge.service
+
+[Service]
+Type=simple
+User=kafka
+Group=kafka
+Environment="JAVA_HOME=/usr/lib/jvm/temurin-21-jdk-amd64"
+ExecStart=/opt/kafka/bin/kafka-server-start.sh /opt/kafka/config/server.properties
+ExecStop=/opt/kafka/bin/kafka-server-stop.sh
+TimeoutStartSec=600
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+
+# 【新增】當 kafka.service 被 enable 或 disable 時，
+# 也對 shioaji_kafka_bridge.service 執行同樣的操作。
+Also=shioaji_kafka_bridge.service
