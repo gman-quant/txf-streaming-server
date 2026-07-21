@@ -5,8 +5,11 @@ After=network-online.target kafka.service
 Requires=kafka.service
 PartOf=kafka.service
 
-# 若 1 分鐘內失敗超過 5 次，就暫停嘗試
-StartLimitIntervalSec=60s
+# 崩潰迴圈保護:10 分鐘內失敗 5 次就停止嘗試。
+# ⚠️ 2026-07-21 修正:原本是 60s/5 次,但 RestartSec=25s 表示 60 秒內最多只重啟 2 次,
+#    永遠碰不到 5 次門檻 → 那道保險等於失效,真遇到 crash loop 會無限重啟。
+#    改成 600s 後,5 次門檻才真的可能觸發。
+StartLimitIntervalSec=600s
 StartLimitBurst=5
 
 [Service]
@@ -24,17 +27,25 @@ OOMScoreAdjust=-500
 # 增加可開啟的檔案/Socket 數量
 LimitNOFILE=65536
 
-# 🚀 [新增] 獨佔 CPU 核心 (CPUAffinity)
-# 說明：將此交易程式鎖定在 CPU 核心 2 上運作，徹底避免核心切換造成的 CPU 快取失效與抖動。
-# 提示：核心編號從 0 開始，若您的伺服器有 4 核（0,1,2,3），核心 2 是一個避開系統中斷的最佳選擇。
-CPUAffinity=2
+# 🚀 獨佔 CPU 核心 (CPUAffinity)
+# 把程式鎖在固定核心,避免核心切換造成 CPU 快取失效與抖動。
+# ⚠️ 2026-07-21 修正:原本只綁 `2`,但本機 i7-4770 是 4 實體核 + HT = 8 邏輯核,
+#    **邏輯核 2 與 6 是同一顆實體核的 HT 兄弟**(/sys/.../cpu2/topology/thread_siblings_list = 2,6),
+#    共用執行單元與 L1/L2。只綁 2 的話,任何排到 6 的工作仍會與本程式搶同一顆實體核。
+#    兩個都綁才是真正獨佔一顆實體核。
+# 📌 換機器務必重新確認:`cat /sys/devices/system/cpu/cpu<N>/topology/thread_siblings_list`
+CPUAffinity=2 6
 
 # --- 預檢機制 ---
 # 等待 Kafka Port 就緒
 ExecStartPre=/bin/bash -c 'until echo > /dev/tcp/localhost/9092; do sleep 1; done'
 
 # --- 重啟策略 ---
-Restart=on-failure
+# ⚠️ 2026-07-21 修正:原本是 `on-failure`,**對 exit code 0 不重啟**。
+#    若 producer 以「乾淨退出」結束(Shioaji session 正常結束、某條路徑走到 sys.exit(0)),
+#    systemd 不會拉起來,服務變成 inactive(dead) 且不算 failure ——
+#    行情就這樣靜默停掉。對「必須一直活著」的資料管線,always 才對。
+Restart=always
 # 配合 Python 內 sleep(5)，形成穩健的重連冷卻
 RestartSec=25s
 
