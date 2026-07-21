@@ -203,3 +203,27 @@ sudo crontab -e
 ## Disclaimer
 
 本專案僅供程式交易研究與教育用途。高頻交易涉及極高風險，使用者需自行承擔 API 連線不穩、報價延遲或系統故障可能導致的損失。
+
+## 在新主機重建(git clone → 可運作)
+
+```bash
+git clone https://github.com/gman-quant/txf-streaming-server.git
+cd txf-streaming-server
+cp .env.example .env && vi .env          # 填入 Shioaji 金鑰與 Kafka 位址
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+#   要完全複製既有生產環境的版本改用:.venv/bin/pip install -r requirements.lock
+
+sudo useradd -r -m -d /home/shioaji_svc shioaji_svc      # 服務帳號
+sudo cp deploy/txf-producer.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now txf-producer
+systemctl status txf-producer && journalctl -u txf-producer -f
+```
+
+⚠️ **`deploy/txf-producer.service` 內含實測調校**,換機器要檢查兩處:
+`CPUAffinity=2`(綁核,核心編號依該機 CPU 數調整)、
+`WorkingDirectory` / `ExecStart` 的路徑(預設 `/home/shioaji_svc/txf-streaming-server`)。
+
+⚠️ **`requirements.txt` 的版本下限反映的是開發鏡像(2026-07-21 升級後)**,
+不是生產機現況。生產機 2026-07-21 實測為 Python 3.12.3 / shioaji 1.3.2 /
+protobuf 6.33.1 / confluent-kafka 2.13.0 —— **刻意未跟進升級**
+(protobuf 6→7 已實測跨版本解碼相容,無升級必要)。
