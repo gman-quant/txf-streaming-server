@@ -1,5 +1,13 @@
-confluent-kafka
+# 直接依賴 + 已測過的版本下限(2026-07-21 全面升級並驗證)。
+# 精確重現用 requirements.lock:uv pip sync --python .venv/Scripts/python.exe requirements.lock
+#
+# ⚠️ 本機是 dev mirror,生產 producer 跑在 Ubuntu 192.168.1.50 —— 這裡的版本不代表那台。
+# ⚠️ protobuf 已與 txf-quant-platform 對齊到 7.35.1(先前 6.33.4,major 落差)。
+#    跨 repo 往返實測過:本 repo 編碼 Tick/BidAsk → platform 解碼,欄位全對。
+#    注意 protobuf 7 移除了 FieldDescriptor.label(本 workspace 無人使用)。
+confluent-kafka>=2.14.2
 dotenv
-grpcio-tools
-shioaji[speed]
+grpcio-tools>=1.82.1
+protobuf>=7.35.1
+shioaji[speed]>=1.7.0
 uvloop; sys_platform != 'win32'
