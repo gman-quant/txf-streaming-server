@@ -17,7 +17,7 @@ Live 行情 producer:Shioaji → Protobuf → Kafka。**生產環境在 Ubuntu 1
 - producer.poll(0) 刻意移到 100ms 背景任務 —— **別加回熱路徑**(GIL 阻塞,commit 0ad6332 的刻意移除)。
 - 下游假設 topic **單一 partition**(data-lake kafka_reader 硬編 TopicPartition(topic, 0))。
 - protobuf 重生成:`python -m grpc_tools.protoc -I protos --python_out=src protos/txf_data.proto`(生成檔是 committed 的,重生成會出現 tracked diff)。
-- README 的 .env 範本已於 2026-07-04 補上 `TICK_R2_TOPIC`(src/config.py 讀取、無預設值,缺了會讓每筆 R2 tick 發送失敗);效能數字(8μs/53萬 msg/s)是合成基準非 live 規格。
+- README 的 .env 範本已於 2026-07-04 補上 `TICK_R2_TOPIC`(src/config.py 讀取、無預設值,缺了會讓每筆 R2 tick 發送失敗)。
 - 部署程序(程式碼如何上 192.168.1.50、伺服器目前在哪個 commit)**無文件、無法從本機驗證** —— 涉及伺服器的問題直接問用戶。
 
 ## 生產機實況(2026-07-21 實查,SSH 唯讀)
@@ -73,3 +73,34 @@ systemd 只知道行程在不在。producer 可能**連得上但不再送 tick**
 天天誤報會讓人忽略真警報)。時段判定含「週五夜盤延到週六凌晨」。
 掛法(systemd timer 範例)寫在腳本尾端。**建議先只告警、觀察數日再開自動重啟** ——
 誤判重啟會製造 bidask 破洞。
+
+## 效能:實測需求 vs 已移除的 benchmark(2026-07-21)
+
+**真實需求**(近 25 個交易日的 tick 實測):單日約 **73,000 筆**、
+**單秒峰值 479 筆/秒**(2026-07-09)。
+
+**保留的有用數據 —— 全鏈路延遲**(30 次取樣,0% 封包遺失;這是唯一量到真瓶頸的表):
+
+| 鏈路 | 平均 | 抖動 | 最差 |
+|---|---|---|---|
+| Server → 券商 API | **5.7 ms** | 2.0 ms | 12.3 ms |
+| Server → PC(LAN) | 0.4 ms | 0.0 ms | 0.5 ms |
+| Server → iPad(LAN) | 1.6 ms | 0.1 ms | 1.8 ms |
+
+### ⚠️ 已移除:兩組誤導性的效能數字
+
+`README` 的「53.8 萬 msg/s、8 μs」與 `performance_test_report.md` 的
+「404,989 TPS、2.47 μs」**已於 2026-07-21 移除**(報告整份刪除、README 章節改寫),
+連同伺服器上的 `tests/performance_test.py`(該檔從未進 git —— `.gitignore` 擋 `tests/`)。
+
+**為什麼移除(不是因為數字錯,是因為量錯維度):**
+- 宣稱能力 40~54 萬 msg/s,實際峰值 479 筆/秒 → **餘裕 845~1,123 倍**。
+  在這種餘裕下,「+23% 吞吐、延遲 3.04→2.47 μs」不具決策價值。
+- 報告據此推論「**已完全具備處理快市海嘯的穩定運算能力**」——**該推論不成立**。
+  快市的瓶頸是券商餵資料速度(同報告自己量到 **5.7 ms**,比 2.47 μs 大 2,300 倍)、
+  Kafka 磁碟寫入、網路。本地 CPU 迴圈的微秒級優化對這三者毫無幫助。
+- 兩組數字在 repo 內並存且未交叉引用(+82% vs +23%、-99% vs -19%),
+  未來讀者無從判斷該信哪個。
+
+**教訓(值得記住的通則):** benchmark 要先確認**測的維度是不是真的約束**。
+量一個有三位數倍餘裕的東西,再漂亮的改善幅度都不會改變任何決策。
