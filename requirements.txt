@@ -9,5 +9,7 @@ confluent-kafka>=2.14.2
 dotenv
 grpcio-tools>=1.82.1
 protobuf>=7.35.1
+# pyarrow 是 shioaji 的相依,明列以與其他 repo 版本一致
+pyarrow>=25.0.0
 shioaji[speed]>=1.7.0
 uvloop; sys_platform != 'win32'
