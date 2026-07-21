@@ -74,6 +74,38 @@ systemctl status kafka
 > unit 裡的 `Wants=shioaji_kafka_bridge.service` 是**已退役的舊服務**(生產機上為
 > inactive),新機器可刪掉那行。
 
+## 3.5 防火牆 —— **這步不能省,省了就真的對外開放**
+
+生產機的實際防護**不在 Kafka 層,在 ufw**(2026-07-21 實查):
+
+```
+Status: active
+Default: deny (incoming), allow (outgoing)
+9092/tcp   ALLOW IN   192.168.1.10        ← 白名單,不是全開
+9092/tcp   ALLOW IN   192.168.1.11
+19092      (無任何規則) → 被預設政策擋掉  ← EXTERNAL 監聽器從未真的開通
+```
+
+也就是說:`server.properties` 裡那個 PLAINTEXT 零認證的 `EXTERNAL://0.0.0.0:19092`
+**一直是被防火牆擋著的**。`advertised.listeners` 雖然填了對外 IP,但那個埠從來沒放行過。
+
+> ⚠️ **照本文件裝一台新的、卻略過這一步,結果會是一台無密碼、對全世界開放的 broker。**
+> Kafka 的設定本身沒有任何保護,安全性完全來自這層。
+
+```bash
+sudo ufw default deny incoming
+sudo ufw default allow outgoing
+# 只放行需要連 Kafka 的機器(換成你的實際 IP)
+sudo ufw allow from 192.168.1.11 to any port 9092 proto tcp
+sudo ufw enable
+sudo ufw status verbose        # 確認第一行是 Default: deny (incoming)
+```
+
+**更乾淨的做法:直接在 `server.properties` 刪掉 EXTERNAL 那組監聽器。**
+既然它從未被使用,留著只是多一個「哪天防火牆改壞就暴露」的隱患
+(要刪的是 `listeners` / `advertised.listeners` / `listener.security.protocol.map`
+三處裡的 `EXTERNAL` 項目)。
+
 ## 4. 建立 topic —— **含保留設定覆寫,這步不能漏**
 
 `server.properties` 的 `log.retention.hours=168`(7 天)會被下面的 **topic 層級設定覆寫**。
