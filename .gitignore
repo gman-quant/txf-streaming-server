@@ -9,6 +9,7 @@
 # 資料夾
 .venv/
 tests/
+scratch/
 
 # ------------------------
 # Logs / Notes

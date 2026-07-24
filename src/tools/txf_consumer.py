@@ -24,8 +24,8 @@ from datetime import datetime
 from confluent_kafka import Consumer, KafkaError
 
 # --- Local Imports ---
-from . import txf_data_pb2
-from .config import (
+from .. import txf_data_pb2
+from ..config import (
     KAFKA_BOOTSTRAP_SERVERS, 
     TICK_TOPIC, 
     BIDASK_TOPIC
