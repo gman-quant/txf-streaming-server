@@ -126,7 +126,7 @@ class TxfStreamingService:
 
     # --- Data Processing Callbacks ---
 
-    def process_tick(self, exchange, quote: TickFOPv1):
+    def process_tick(self, quote: TickFOPv1):
         """處理 Tick 並推送到 Kafka"""
         try:
             if quote.simtrade == 1: return
@@ -157,7 +157,7 @@ class TxfStreamingService:
         except Exception as e:
             logger.error(f"❌ Tick Process Error: {e}")
 
-    def process_bidask(self, exchange, quote: BidAskFOPv1):
+    def process_bidask(self, quote: BidAskFOPv1):
         """處理 BidAsk 並推送到 Kafka"""
         try:
             if quote.simtrade == 1: return
@@ -213,12 +213,12 @@ class TxfStreamingService:
         logger.info("🔑 Logging into Shioaji...")
         self.api = sj.Shioaji(simulation=True)
         try:
-            # contracts_timeout=10000: 登入時同步等待合約下載 (最多 10秒)
-            # 這能避免手動呼叫 fetch_contracts() 造成的 race condition (IndexError)
+            # shioaji 1.7 內部自管合約:login 回來時合約即就緒(實測 ~0.3s),無需 contracts_timeout。
+            # ⚠ 該參數 1.7 已從 login 簽章移除,傳入會 TypeError(舊版靠它同步等待、避開
+            #   fetch_contracts race;1.7 由 SDK 內部處理,不再需要)。
             self.api.login(
-                api_key=SHIOAJI_API_KEY, 
-                secret_key=SHIOAJI_SECRET_KEY, 
-                contracts_timeout=10000
+                api_key=SHIOAJI_API_KEY,
+                secret_key=SHIOAJI_SECRET_KEY,
             )
             logger.info("✅ Login & Contracts Loaded")
         except Exception as e:
@@ -239,49 +239,49 @@ class TxfStreamingService:
 
         # 綁定事件
         self.api.on_session_down(self._handle_session_down)
-        self.api.quote.on_event(self._handle_solace_event)
+        self.api.on_event(self._handle_solace_event)
         
         # 綁定數據回調 (直接綁定方法，不需額外裝飾器)
-        self.api.quote.set_on_tick_fop_v1_callback(self.process_tick)
-        self.api.quote.set_on_bidask_fop_v1_callback(self.process_bidask)
+        self.api.set_on_tick_fop_v1_callback(self.process_tick)
+        self.api.set_on_bidask_fop_v1_callback(self.process_bidask)
 
         # 訂閱
         logger.info("⏳ Looking for TXF contracts...")
         
-        # Robust Contract Lookup (Fix for AttributeError: 'StreamMultiContract' object has no attribute 'TXFR1')
+        # 合約解析(shioaji 1.7 v2 contracts API):抓一份完整合約 list、以 code 索引,
+        # 取連續合約 TXFR1/TXFR2。舊版「dict 直取 → except → 手動迭代」是在繞 v1 的
+        # StreamMultiContract 怪脾氣;v2 的 futures() 直接給完整 list(name / delivery_* /
+        # target_code 實測齊全),主路徑與 fallback 共用同一份、短很多。
+        # ⚠ 不可改用 api.contracts.get("TXFR1"):它回閹割版(缺 name/delivery_month/delivery_date)。
         try:
-            self.contract_r1 = self.api.Contracts.Futures.TXF["TXFR1"] 
-            logger.info(f"✅ Found Near Month via direct lookup: {self.contract_r1.name} ({self.contract_r1.code})")
-        except (AttributeError, KeyError):
-            logger.warning("⚠️ 'TXFR1' direct lookup failed, attempting manual iteration...")
-            try:
-                # 排除 TXFR1/TXFR2 這種別名，找出實際帶有 target_code 的合約，或是過濾長度
-                txf_contracts = [
-                    c for c in self.api.Contracts.Futures.TXF 
-                    if c.code.startswith('TXF') and len(c.code) == 5 and not c.code.startswith('TXFR')
-                ]
-                txf_contracts.sort(key=lambda x: x.delivery_date)
-                
-                if txf_contracts:
-                    self.contract_r1 = txf_contracts[0]
-                    if len(txf_contracts) > 1:
-                        self.contract_r2 = txf_contracts[1]
-                    logger.info(f"✅ Found Near Month via fallback: {self.contract_r1.name} ({self.contract_r1.code})")
-                else:
-                    raise ValueError("No TXF contracts found in lookup.")
-            except Exception as e:
-                logger.critical(f"❌ Contract Lookup Failed: {e}")
-                sys.exit(1)
+            txf = self.api.contracts.futures("TXF")
+            by_code = {c.code: c for c in txf}
+            self.contract_r1 = by_code.get("TXFR1")
+            self.contract_r2 = by_code.get("TXFR2")
+
+            if self.contract_r1 is None:  # fallback:同一份 list 取最近兩個月合約
+                months = sorted(
+                    (c for c in txf if len(c.code) == 5 and c.code[:3] == "TXF"
+                     and not c.code.startswith("TXFR")),
+                    key=lambda c: c.delivery_date,
+                )
+                if months:
+                    self.contract_r1 = months[0]
+                    if self.contract_r2 is None and len(months) > 1:
+                        self.contract_r2 = months[1]
+                    logger.warning(f"⚠️ 'TXFR1' 不在 list,改用最近月合約: {self.contract_r1.code}")
+        except Exception as e:
+            logger.critical(f"❌ Contract Lookup Failed: {e}")
+            sys.exit(1)
 
         if not self.contract_r1:
             logger.critical("❌ Failed to identify TXF contract.")
             sys.exit(1)
-            
-        try:
-            if not self.contract_r2:
-                self.contract_r2 = self.api.Contracts.Futures.TXF["TXFR2"]
+        logger.info(f"✅ Found Near Month: {self.contract_r1.name} ({self.contract_r1.code})")
+
+        if self.contract_r2:
             logger.info(f"✅ Found Next Month: {self.contract_r2.name} ({self.contract_r2.code})")
-        except (AttributeError, KeyError):
+        else:
             logger.warning("⚠️ Could not find TXFR2 contract. Only R1 will be streamed.")
 
         logger.info("⏳ Subscribing to TXF contracts...")
@@ -291,8 +291,8 @@ class TxfStreamingService:
         if hasattr(self.contract_r1, 'delivery_month'):
             r1_desc += f" [Delivery: {self.contract_r1.delivery_month}]"
             
-        self.api.quote.subscribe(self.contract_r1, quote_type=sj.constant.QuoteType.Tick)
-        self.api.quote.subscribe(self.contract_r1, quote_type=sj.constant.QuoteType.BidAsk)
+        self.api.subscribe(self.contract_r1, quote_type=sj.QuoteType.Tick)
+        self.api.subscribe(self.contract_r1, quote_type=sj.QuoteType.BidAsk)
         logger.info(f"✅ Subscribed R1 (Tick + BidAsk): {r1_desc}")
         
         if self.contract_r2:
@@ -300,7 +300,7 @@ class TxfStreamingService:
             if hasattr(self.contract_r2, 'delivery_month'):
                 r2_desc += f" [Delivery: {self.contract_r2.delivery_month}]"
                 
-            self.api.quote.subscribe(self.contract_r2, quote_type=sj.constant.QuoteType.Tick)
+            self.api.subscribe(self.contract_r2, quote_type=sj.QuoteType.Tick)
             logger.info(f"✅ Subscribed R2 (Tick only): {r2_desc}")
         
         self.running = True
