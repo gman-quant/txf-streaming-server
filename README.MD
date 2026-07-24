@@ -45,7 +45,8 @@ Protobuf 3;價格欄位一律 **Scaled Integer(實際價 × 10000)**,還原時 �
 git clone https://github.com/gman-quant/txf-streaming-server.git
 cd txf-streaming-server
 
-uv venv
+uv python install 3.13              # 首次:取得 .python-version 鎖定的 Python 3.13
+uv venv                             # 依 .python-version 建 venv(Python 3.13)
 . .venv/Scripts/activate            # Windows(mac/Linux:. .venv/bin/activate)
 uv pip install -r requirements.txt  # 精確重現既有環境用 requirements.lock
 
@@ -93,7 +94,7 @@ unit 檔已含實測調校(CPU 綁核、OOM 保護、`SIGINT` graceful stop),見
 git clone https://github.com/gman-quant/txf-streaming-server.git
 cd txf-streaming-server
 cp .env.example .env && vi .env
-python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+uv python install 3.13 && uv venv && uv pip install -r requirements.txt   # .python-version 鎖 Python 3.13
 
 sudo useradd -r -m -d /home/shioaji_svc shioaji_svc
 sudo cp deploy/txf-producer.service /etc/systemd/system/
