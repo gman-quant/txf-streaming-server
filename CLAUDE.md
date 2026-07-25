@@ -43,7 +43,8 @@ protobuf 6→7 跨版本解碼相容已實測(本 repo 編碼→platform 用 6.x
 ### ⚠️ 部署方式:2026-07-25 起改為 `git clone`,舊的「手動複製」已終結
 
 2026-07-25 升級時**整個目錄重新 clone**(舊目錄備份成 `txf-streaming-server.bak.2026-07-25`),
-所以生產機的 `git log` **從此可信**(釘在 `ef7fb08`)。
+所以生產機的 `git log` **從此可信** —— 要知道它在跑哪版就直接查,別在本檔記 hash(會腐爛):
+`sudo -u shioaji_svc bash -lc 'cd /home/shioaji_svc/txf-streaming-server && git log --oneline -1'`
 2026-07-21 之前的舊狀態(`.git` 停在 `a5dfdec` 但檔案是手動複製的較新版)已不再適用。
 `.env.example` 與 `deploy/txf-producer.service` 都在 repo 內,新主機 clone 就重建得出來。
 
