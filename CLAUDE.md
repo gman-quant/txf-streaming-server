@@ -27,7 +27,10 @@ Live 行情 producer:Shioaji → Protobuf → Kafka。**生產環境在 Ubuntu 1
 —— 啟停由 root crontab 控制,不靠開機自啟。
 **版本(2026-07-25 升級)**:Python **3.13.14** / shioaji **1.7.0** / protobuf 7.35.1 /
 confluent-kafka 2.15.0 / grpcio 1.83.0 / uvloop 0.22.1。依賴由 **uv** 管理。
-protobuf 6→7 跨版本解碼相容已實測(本 repo 編碼→platform 用 6.x 解碼,欄位全對)。
+**protobuf 版本歪斜已於本次升級消失**:生產機從 6.33.1 上到 7.35.1 後,
+四個 repo(streaming-server / quant-platform / gale-engine / data-lake)**全部統一 7.35.1**
+(2026-07-25 實查)。過去記錄的「6→7 跨版本解碼相容」是升級前的狀態,現已不適用 ——
+**若日後只升其中一邊,歪斜會回來,屆時要重驗**。
 
 ### crontab 啟停排程(root crontab,2026-07-25 實查)
 
