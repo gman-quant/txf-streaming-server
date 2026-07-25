@@ -5,10 +5,10 @@
 
 ```
 永豐 Shioaji API
-   │
-   ├─（即時·本專案）→ txf-streaming-server ─Protobuf→ Kafka ─┬─→ txf-quant-platform（看盤/回測）
-   │                                                        └─→ txf-gale-engine（戰情室）
-   └─（歷史）→ txf-data-lake ──Polars──→ Parquet 資料湖 ────────→ txf-quant-platform
+   ├─（即時）→ 【本專案】txf-streaming-server ─Protobuf→ Kafka ──┐
+   └─（歷史）→ txf-data-lake ─────Polars─────→ Parquet ─────────┤
+                                          (D:\txf-data)        ├─→ txf-quant-platform（看盤/回測）
+                                                               └─→ txf-gale-engine（戰情室看板）
 ```
 
 **Kafka 的消費者是 quant-platform 與 gale-engine**;`txf-data-lake` 走 Shioaji 歷史 API,不碰 Kafka。
@@ -23,14 +23,18 @@
 
 ## 1. 要部署一整套?照這個順序
 
-| 順序 | 做什麼 | 看哪份文件 |
-|---|---|---|
-| 1️⃣ | **架 Kafka broker**(空白機器從零) | [`deploy/kafka/SETUP.md`](deploy/kafka/SETUP.md) |
-| 2️⃣ | **部署本專案**(producer) | 本文件第 2、3 節 |
-| 3️⃣ | 部署消費端(看盤 / 回測) | `txf-quant-platform` 的 README |
-| — | 歷史資料湖(獨立於 Kafka,可平行做) | `txf-data-lake` 的 README |
+| 順序 | 做什麼 | 看哪份文件 | 需要 Kafka? |
+|---|---|---|---|
+| 1️⃣ | **架 Kafka broker**(空白機器從零) | [`deploy/kafka/SETUP.md`](deploy/kafka/SETUP.md) | — |
+| 2️⃣ | **部署本專案**(producer,行情進 Kafka) | 本文件第 2、3 節 | ✅ |
+| 3️⃣ | 建歷史資料湖(**可與 1️⃣2️⃣ 平行做,不需 Kafka**) | `txf-data-lake` README | ❌ |
+| 4️⃣ | 消費端:看盤 / 回測 / 策略 | `txf-quant-platform` README | 只有即時看盤要 |
+| 5️⃣ | 消費端:當沖戰情室看板 | `txf-gale-engine` README | 只有 live 模式要 |
 
-> 目標機器**已經有 Kafka** 就跳過 1️⃣。
+- 目標機器**已經有 Kafka** 就跳過 1️⃣。
+- 4️⃣5️⃣ **兩個消費端都需要 3️⃣ 的 Parquet 資料湖**(回測、日線、prev-close 都靠它),
+  只有「即時跳動」那部分才走 Kafka。**先把資料湖建起來,兩個看盤器就能離線用了。**
+- 四個 repo 都用 **Python 3.13 + uv**,依賴各自獨立(每個 repo 自己的 `.venv`)。
 
 ---
 
