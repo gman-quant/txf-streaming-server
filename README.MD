@@ -163,100 +163,40 @@ python -m grpc_tools.protoc -I protos --python_out=src protos/txf_data.proto
 
 ---
 
-## 5. 這台機器夠不夠?怎麼自己量
+## 5. 規模與資源需求
 
-以下數字**不是 benchmark**,是從生產環境的 Kafka 與 systemd 直接量出來的
-(2026-07-25,涵蓋 2025-12 起 190 個交易日、7,860 萬則訊息)。
-**換機器後照下面的指令自己重量一次**,別直接引用這裡的數字。
-
-### 實際負載
+實測值(2026-07,涵蓋 2025-12 起 190 個交易日):
 
 | | |
 |---|---|
-| 日均 | **413,787 則** |
-| 最忙一天 | **787,302 則**(2026-03-03) |
-| **峰值(全 topic 合計,滑動 1 秒)** | **353 則/秒**(p99 僅 50/秒) |
-| 成長 | 2025-12 日均 28.7 萬 → 2026-06 日均 49.3 萬(**8 個月 +72%**) |
+| 訊息量 | 日均 **41 萬則**,最忙一天 79 萬則 |
+| 峰值 | **353 則/秒**(p99 僅 50/秒) |
+| 組成 | **BidAsk 佔 86%**、Tick 14%、R2 <1% |
+| 磁碟 | BidAsk 約 **52 MB/天** ≈ 19 GB/年;Tick 寬鬆得多 |
+| CPU | **< 1% 的一顆核心**(i7-4770 實測) |
+| 成長 | 8 個月 +72% |
 
-組成(最忙那天):`txf-bidask` **50 萬則(86%)**、`txf-tick` 16.5 萬、`txfr2-tick` <1%。
+**給部署者的三個結論:**
 
-> ⚠️ **BidAsk 才是主要負載,不是 tick。** 只算 tick 會低估八倍 ——
-> 早期文件寫「單日 73,000 筆」就是只算了 tick。評估硬碟、頻寬、保留期時務必用合計值。
+1. **CPU 不是問題**,一般機器綽綽有餘;真正要規劃的是**磁碟與 Kafka 保留期**。
+2. **算容量要用合計值,別只算 Tick** —— BidAsk 是 Tick 的六倍,只算 Tick 會低估八倍。
+   保留期設定見 [`deploy/kafka/SETUP.md`](deploy/kafka/SETUP.md) 第 5 節。
+3. **量增長很快**(8 個月 +72%),`retention.bytes` 要留餘裕 —— 大小上限先到會**靜默**砍掉
+   還沒滿一年的資料。
 
-**峰值怎麼算的**(這個數字很容易被算錯,寫清楚):
-
-- **滑動 1 秒視窗**,不是固定桶。對齊整秒的固定桶會把跨邊界的爆量切成兩半而低估 ——
-  同一天固定桶只報 316/秒,滑動才是真實觀測的 353/秒(2026-07-09 差更多:261 vs 340)。
-- **全 topic 合計**,因為 producer 是單一行程同時扛三條流。
-- 依 **produce 時間**分桶 = producer 實際要扛的速率。改依**交易所時間**分桶是「市場爆量速率」,
-  同日略高(tick 187、bidask 195 則/秒),但同一數量級。
-- ⚠️ 更早的文件曾寫「單秒峰值 479 筆/秒」,**兩種時間軸都重現不出來**,量法不明,已不採用。
-
-### CPU 餘裕(systemd 自己在量,免費)
-
-每次收工 journal 都有一行 `Consumed X CPU time`,那是**真實流量下的實測**,
-不需要跑任何 benchmark:
+### 想在自己機器上重量
 
 ```bash
-journalctl -u txf-producer --since "7 days ago" | grep Consumed
+python -m src.tools.measure_load scan                      # 全史負載(零消費,幾十秒)
+python -m src.tools.measure_load profile --date <YYYY-MM-DD>   # 峰值與延遲分布
+python -m src.tools.measure_load verify  --date <YYYY-MM-DD>   # 與資料湖對帳,驗有無遺漏
+python -m src.tools.measure_load stalls  --start-date <D> --end-date <D>   # 找供料中斷
 ```
 
-實測結果:**0.6 ~ 1.0% 的一顆核心**(日盤 5 小時消耗 2~3 分鐘 CPU;夜盤 14 小時 5~6 分鐘)。
-**本地 CPU 不是瓶頸**,而這是量出來的、不是推算的。
+CPU 餘裕不必另外測,systemd 每次收工都會記:`journalctl -u txf-producer | grep Consumed`。
 
-> 這是整段時段的**平均**。要抓峰值得在開盤時以 1 秒間隔採樣 `/proc/<pid>/stat` 取 max。
-
-### 延遲(每一則訊息都自帶,不必 ping)
-
-topic 設定是 `message.timestamp.type=CreateTime`,所以 **Kafka 訊息時間戳 = produce 當下的
-本機時鐘**,而 payload 的 `timestamp_ms` = **交易所時間**。兩者相減就是端到端延遲。
-
-```bash
-python -m src.tools.measure_load profile --date 2026-07-24
-```
-
-| 日期 | tick p50 | tick p99 | max |
-|---|---|---|---|
-| 平靜日(2026-07-09) | 74 ms | 143 ms | 171 ms |
-| 最忙日(2026-03-03) | 178 ms | 773 ms | 4,337 ms |
-
-- **BidAsk 的 p50 只有 5~7 ms,tick 卻是 74~178 ms** —— 這不是傳輸差異,是**時間戳語意不同**
-  (tick 帶撮合時間、bidask 帶快照時間),別拿兩者互相比較。
-- ⚠️ **前提是機器有 NTP 校時**(`timedatectl` 看 `System clock synchronized: yes`)。
-  沒校時的話量到的是時鐘偏差。工具偵測到負延遲會出警告。
-
-### 完整性:兩條獨立路徑對帳
-
-比對 Kafka(即時 producer)與資料湖(Shioaji 歷史 API)—— 兩者取得路徑完全獨立,
-對得上就是真的沒漏:
-
-```bash
-python -m src.tools.measure_load verify --date 2026-07-24
-```
-
-實測 2026-03-03 與 2026-07-24:**筆數與口數完全一致,零遺漏**。
-
-> 🔴 別用 `total_volume` 的跳號推遺漏 —— 那個假設不成立,會產生大量假警報
-> (誤報 659 次不連續,而同日跨來源對帳其實完全一致)。
-
-### 找供料中斷
-
-```bash
-python -m src.tools.measure_load stalls --start-date 2026-07-01 --end-date 2026-07-25
-```
-
-依「空窗前 60 秒的實際速率」推算該有幾則訊息,所以冷清時段不會誤報。
-2026-07 實測只有兩次:一次是市場端(資料湖獨立佐證)、一次是券商斷線
-(當時因回調 bug 導致自癒失效,已於 `1ed0764` 修復)。
-
-### 全史負載掃描(零消費,幾十秒)
-
-```bash
-python -m src.tools.measure_load scan
-```
-
-只查 Kafka 位移、不搬任何訊息,產出每日總量、月趨勢、最尖峰的時段。
-**部署新機器規劃硬碟與保留期時先跑這個。**
+> 量測方法的細節與坑(滑動 vs 固定視窗、produce vs 交易所時間軸、已判死的遺漏偵測法)
+> 寫在 `src/tools/measure_load.py` 的檔頭與 `CLAUDE.md`,部署不需要讀。
 
 ![server status](pic/1.png)
 
