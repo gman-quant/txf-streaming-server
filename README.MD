@@ -125,41 +125,18 @@ systemd 只知道行程在不在,測不到「連得上但不再送 tick」(斷�
 
 ---
 
-## 4. 資料格式(wire schema)
+## 4. 資料格式
 
-Protobuf 3;價格一律 **Scaled Integer(實際價 × 10000)**,還原時 ÷10000。
-`protos/txf_data.proto` 是**跨 repo 共用的契約**,改動會波及所有下游消費者。
+Protobuf 3,**價格一律 ×10000 的整數**(還原 ÷10000),時間是交易所時間的 epoch 毫秒。
 
-### Tick (`txf.Tick`)
-| Field | Type | 說明 |
-| :--- | :--- | :--- |
-| `code` | string | 商品代碼(如 `TXFH6`) |
-| `timestamp_ms` | int64 | Unix Epoch (ms) |
-| `close` | int64 | 成交價 ×10000 |
-| `volume` | int32 | 單筆量 |
-| `tick_type` | int32 | 1:外盤 / 2:內盤 |
-| `total_volume` | int32 | 當日總量(可用來偵測封包遺漏) |
-| `underlying_price` | int64 | 標的價 ×10000 |
+| 來源 | Topic |
+|---|---|
+| TXFR1 tick | `txf-tick` |
+| TXFR2 tick | `txfr2-tick`(**R2 無 BidAsk**) |
+| TXFR1 BidAsk | `txf-bidask` |
 
-### BidAsk (`txf.BidAsk`)
-| Field | Type | 說明 |
-| :--- | :--- | :--- |
-| `bid/ask_total_vol` | int32 | 委託總量 |
-| `bid/ask_price` | repeated int64 | 五檔價 ×10000 |
-| `bid/ask_volume` | repeated int32 | 五檔量 |
-| `diff_..._vol` | repeated int32 | 五檔掛單變化量 |
-
-**Topic 路由**:TXFR1 tick → `txf-tick`、TXFR2 tick → `txfr2-tick`(R2 無 BidAsk)、
-TXFR1 BidAsk → `txf-bidask`。
-
-> R2 的 `quote.code` 是**真實月份碼**(如 `TXFI6`)不是 `"TXFR2"`,路由要同時比對
-> `target_code` —— 這是修過的 bug,別退回。
-
-### 改了 `.proto` 之後
-
-```bash
-python -m grpc_tools.protoc -I protos --python_out=src protos/txf_data.proto
-```
+**完整欄位定義、路由陷阱、改 schema 的注意事項 → [`protos/WIRE.md`](protos/WIRE.md)。**
+`txf_data.proto` 是跨 repo 共用契約,改動會波及所有下游消費者。
 
 ---
 
