@@ -204,7 +204,23 @@ class TxfStreamingService:
 
     # --- System Events ---
 
-    def _handle_session_down(self, reason):
+    def _handle_session_down(self, reason: str = "SDK 未提供原因", *_extra):
+        """券商連線中斷 → 乾淨關閉 + exit(1),交給 systemd 重啟(自癒的本體)。
+
+        🔴 `reason` **必須有預設值,別改回必填** —— 這個函式有兩條呼叫路徑,arity 不同:
+             1. `api.on_session_down(self._handle_session_down)` → pysolace **不帶參數**呼叫
+             2. `_handle_solace_event()` 內部呼叫 → 帶 reason 字串
+
+           2026-07-20 20:57 事故:簽章當時是 `(self, reason)` 必填,真正斷線時
+           pysolace 零參數呼叫 → `TypeError: missing 1 required positional argument`
+           → **下面的 shutdown/exit(1) 從來沒執行過,自癒機制等於不存在**。
+           那次能恢復純屬僥倖(Solace SDK 自己的重連剛好成功),行情靜默了 75 秒;
+           若重連失敗,producer 會停在「行程活著、systemd 顯示 active、卻完全不送資料」
+           —— systemd 永遠發現不了,只有 deploy/check_feed_alive.sh 抓得到。
+
+           `*_extra` 是防呆:未來 SDK 若改成帶參數呼叫,也不會再因為 arity 不合而炸掉。
+           這個回調的失敗模式是「靜默停止供料」,值得多這一層保險。
+        """
         logger.critical(f"🚨 Session Down: {reason}. Triggering Systemd Restart.")
         self.shutdown()
         sys.exit(1)
