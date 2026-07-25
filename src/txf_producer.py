@@ -8,8 +8,23 @@ Architecture:
   - Routing: Dual-Topic Dispatch (TXFR1 -> txf-tick, TXFR2 -> txfr2-tick)
   - Optimization: Class encapsulation, lazy loading, error isolation
   - Asyncio Engine: uvloop (High-Performance Event Loop)
+
+Requires: shioaji >= 1.7, Python 3.13(兩者由 requirements.txt / .python-version 鎖定)
+
+shioaji 1.7 遷移點(2026-07-24,**不可退回 1.3.x 寫法**):
+  - login() 拿掉 `contracts_timeout`(1.7 已移除該參數,傳了會 TypeError)
+  - 合約改 `api.contracts.futures("TXF")` 取完整清單再以 `c.code` 建索引。
+    **不要用 `api.contracts.get("TXFR1")`** —— 它回傳的是精簡合約,
+    缺 name / delivery_month / delivery_date,日誌與交割月判斷會壞。
+  - 行情回調改 **1-arg**(`process_tick(self, quote)`);2-arg 舊簽章在 1.7 只剩
+    DeprecationWarning,將來會直接失效。
+  - `sj.constant.QuoteType` -> `sj.QuoteType`;`api.quote.subscribe` -> `api.subscribe`。
+
+退出碼語意(systemd `Restart=` 依此判斷):所有錯誤路徑一律 `sys.exit(1)`;
+exit 0 只發生在收到 SIGTERM/SIGINT 後的乾淨關閉(見 main() 的 stop_event)。
+
 Author: Garrett & Gemini
-Last Updated: 2026-06-14
+Last Updated: 2026-07-25(shioaji 1.7 + Python 3.13:07-24 改碼、07-25 上生產機驗證通過)
 """
 
 import sys

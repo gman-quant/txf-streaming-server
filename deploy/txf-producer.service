@@ -41,12 +41,23 @@ CPUAffinity=2 6
 ExecStartPre=/bin/bash -c 'until echo > /dev/tcp/localhost/9092; do sleep 1; done'
 
 # --- 重啟策略 ---
-# ⚠️ 2026-07-21 修正:原本是 `on-failure`,**對 exit code 0 不重啟**。
-#    若 producer 以「乾淨退出」結束(Shioaji session 正常結束、某條路徑走到 sys.exit(0)),
-#    systemd 不會拉起來,服務變成 inactive(dead) 且不算 failure ——
-#    行情就這樣靜默停掉。對「必須一直活著」的資料管線,always 才對。
+# ⚠️ 2026-07-21 改 `on-failure` → `always`(2026-07-25 依實際碼修正本註解)。
+#    事實:producer 的**所有錯誤路徑都是 sys.exit(1)**,碼裡沒有 sys.exit(0);
+#    exit 0 只發生在「收到 SIGTERM/SIGINT → stop_event → 乾淨關閉」。
+#    → 所以 on-failure 其實已涵蓋所有現實的崩潰模式,always 多接住的只有一種:
+#      **有東西送了 SIGTERM 但不是透過 systemctl stop**(手滑 kill、清理腳本、session 掃除)。
+#      那種情況 exit 0、不算 failure,on-failure 會讓它靜靜躺到下次 crontab 啟動,
+#      中間行情全丟。機率低但屬靜默資料遺失,always 是便宜的保險。
+#    ✅ 不影響 crontab:`systemctl stop` 是明確停止,Restart= 對它不生效。
+#    ⚠️ 注意「連得上但不送資料」(卡在 await)**不會退出**,Restart= 管不到 ——
+#      那是 deploy/check_feed_alive.sh 的守備範圍。
 Restart=always
 # 配合 Python 內 sleep(5)，形成穩健的重連冷卻
+# 📌 與上面 StartLimit 的交互作用(2026-07-25 記):25s × 5 次 ≈ **100 秒內失敗 5 次就放棄**,
+#    unit 進 failed 躺著。好處=不會猛敲登入觸發 451 Too Many Connections 鎖帳號;
+#    代價=若 08:40 券商端故障超過約 2 分鐘,日盤整段沒資料(要等 14:55 crontab 再啟,
+#    那時 600s 窗已過,start 會成功)。想讓短暫故障能熬過去就把這裡拉到 60s
+#    (5 次攤在 5 分鐘內,crash loop 一樣擋得住)。目前刻意維持 25s。
 RestartSec=25s
 
 # --- 關閉行為 ---

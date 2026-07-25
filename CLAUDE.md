@@ -11,7 +11,7 @@ Live 行情 producer:Shioaji → Protobuf → Kafka。**生產環境在 Ubuntu 1
 
 ## 事實
 
-- 執行必須是模組形式:`python -m src.txf_producer`(相對 import;直接跑檔案會 ImportError)。venv Python 3.12。
+- 執行必須是模組形式:`python -m src.txf_producer`(相對 import;直接跑檔案會 ImportError)。venv Python 3.13(uv 管理,`.python-version` 鎖定)。
 - Topic 路由:TXFR1 tick→txf-tick、TXFR2 tick→txfr2-tick(**R2 無 BidAsk**)、R1 BidAsk→txf-bidask。R2 的 quote.code 是真實合約碼(如 TXFG6)非 "TXFR2",路由要同時比對 target_code(commit 6441f48 修的 bug,別退回)。
 - simtrade==1(試撮)事件被過濾,不進 Kafka。
 - producer.poll(0) 刻意移到 100ms 背景任務 —— **別加回熱路徑**(GIL 阻塞,commit 0ad6332 的刻意移除)。
@@ -20,21 +20,37 @@ Live 行情 producer:Shioaji → Protobuf → Kafka。**生產環境在 Ubuntu 1
 - README 的 .env 範本已於 2026-07-04 補上 `TICK_R2_TOPIC`(src/config.py 讀取、無預設值,缺了會讓每筆 R2 tick 發送失敗)。
 - 部署程序(程式碼如何上 192.168.1.50、伺服器目前在哪個 commit)**無文件、無法從本機驗證** —— 涉及伺服器的問題直接問用戶。
 
-## 生產機實況(2026-07-21 實查,SSH 唯讀)
+## 生產機實況(2026-07-25 升級後實況)
 
-**主機**:`home-lab` / Ubuntu 24.04.4 LTS / i7-4770(4 實體核 + HT = 8 邏輯核)/ 7.7 GB RAM / 磁碟 98G 用 23G。
-**服務**:`txf-producer.service` active,`User=shioaji_svc`,`NRestarts=0`(從未因失敗重啟)。
-**版本**:Python 3.12.3 / shioaji 1.3.2 / protobuf 6.33.1 / confluent-kafka 2.13.0 / grpcio 1.78.0 / uvloop 0.22.1。
-**刻意不跟本機一起升級** —— protobuf 6→7 已實測跨版本解碼相容(本 repo 編碼→platform 解碼,欄位全對),
-shioaji 是餵全部行情的東西,沒有獨立理由不該動。
+**主機**:`home-lab` / Ubuntu 24.04.4 LTS / i7-4770(4 實體核 + HT = 8 邏輯核)/ 7.7 GB RAM。
+**服務**:`txf-producer.service`,`User=shioaji_svc`。**`systemctl is-enabled` = disabled 是正確的**
+—— 啟停由 root crontab 控制,不靠開機自啟。
+**版本(2026-07-25 升級)**:Python **3.13.14** / shioaji **1.7.0** / protobuf 7.35.1 /
+confluent-kafka 2.15.0 / grpcio 1.83.0 / uvloop 0.22.1。依賴由 **uv** 管理。
+protobuf 6→7 跨版本解碼相容已實測(本 repo 編碼→platform 用 6.x 解碼,欄位全對)。
 
-### ⚠️ 部署方式:手動複製,`git log` 會說謊
+### crontab 啟停排程(root crontab,2026-07-25 實查)
 
-生產機的 `.git` 停在 `a5dfdec`(2025-11-30),但實際檔案是後來**手動複製貼上**的較新版本。
-2026-07-21 逐檔比對確認:**`src/*.py` 與本地 main 內容完全相同**
-(唯一差異是 CRLF/LF 與 `config.py` 結尾換行符;`txf_producer.py` 兩邊都是 15380 bytes)。
-→ **別用伺服器上的 `git log` 判斷它在跑什麼版本。**
-→ 已補 `.env.example` 與 `deploy/txf-producer.service` 進 repo,新主機 `git clone` 才真的重建得出來。
+| 時間 | 動作 | 對應 |
+|---|---|---|
+| 08:40 一–五 | start | 日盤 08:45 |
+| 13:46 一–五 | stop | 日盤收 13:45 |
+| 14:55 一–五 | start | 夜盤 15:00 |
+| 05:01 二–六 | stop | 夜盤收 05:00 |
+
+→ 週末整段不跑。**要動生產機,週六是最安全的窗口**(服務本來就 inactive,零 bidask 破洞風險)。
+
+### ⚠️ 部署方式:2026-07-25 起改為 `git clone`,舊的「手動複製」已終結
+
+2026-07-25 升級時**整個目錄重新 clone**(舊目錄備份成 `txf-streaming-server.bak.2026-07-25`),
+所以生產機的 `git log` **從此可信**(釘在 `ef7fb08`)。
+2026-07-21 之前的舊狀態(`.git` 停在 `a5dfdec` 但檔案是手動複製的較新版)已不再適用。
+`.env.example` 與 `deploy/txf-producer.service` 都在 repo 內,新主機 clone 就重建得出來。
+
+### uv 的 PATH 陷阱(runbook 實戰補充)
+
+`uv` 裝在 `/home/shioaji_svc/.local/bin`,而 **`sudo -u shioaji_svc uv …` 不會載入該使用者的登入環境
+→ 找不到 uv**。一律用 `sudo -u shioaji_svc bash -lc '…'` 包起來(或用絕對路徑)。
 
 ### Kafka 保留設定(topic 層級覆寫,`server.properties` 的 168h 不作數)
 
@@ -57,11 +73,18 @@ shioaji 是餵全部行情的東西,沒有獨立理由不該動。
 
 → **改設定隨時可做,重啟一律等收盤**(週六 05:00 後,或平日 13:45–15:00 盤間)。
 
-### unit 檔的三個已修缺口(2026-07-21,已改 repo 內版本,尚未套用到生產機)
+### unit 檔的三個缺口(2026-07-21 發現,**2026-07-25 已套用到生產機**)
 
-1. `Restart=on-failure` → `always`:原設定**對 exit code 0 不重啟**,乾淨退出會讓行情靜默停掉。
+1. `Restart=on-failure` → `always`:多接住「非 systemctl 的 SIGTERM 導致 exit 0」。
+   ⚠️ 07-21 原註解宣稱「Shioaji session 正常結束 / 某條路徑走到 sys.exit(0)」——
+   **查碼後證實不成立**(所有錯誤路徑都是 `sys.exit(1)`,碼裡沒有 `sys.exit(0)`;
+   exit 0 只來自訊號觸發的乾淨關閉)。unit 內註解已於 07-25 改成事實正確版本。
+   對 crontab 無影響:`systemctl stop` 是明確停止,`Restart=` 不生效。
 2. `StartLimitIntervalSec=60s` → `600s`:原設定配 `RestartSec=25s`,60 秒最多重啟 2 次,
    **5 次門檻永遠碰不到 → 崩潰迴圈保護等於失效**。
+   📌 副作用:保護生效後變成「**約 100 秒內失敗 5 次就放棄**」,若開盤時券商端故障超過 2 分鐘,
+   日盤整段沒資料(等 14:55 crontab 再啟)。想讓短暫故障熬得過去可把 `RestartSec` 拉到 60s;
+   目前**刻意維持 25s**(優先避免猛敲登入觸發 451 鎖帳號)。
 3. `CPUAffinity=2` → `2 6`:邏輯核 2 與 6 是**同一顆實體核的 HT 兄弟**
    (`/sys/devices/system/cpu/cpu2/topology/thread_siblings_list` = `2,6`),只綁 2 仍會被核 6 的工作搶。
 
