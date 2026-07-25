@@ -75,7 +75,18 @@ systemctl is-active txf-producer                        # → inactive
 ```
 
 > 📌 收盤窗做這個升級時,**smoke 測試只證明得了前三關**(登入/合約/訂閱)——
-> tick → protobuf → Kafka 那段沒有行情可驗,要等下一個開盤。
+> tick → protobuf → Kafka 那段沒有行情可驗。
+
+**收盤也能驗後兩關**(合成報價,**只寫測試 topic**,不必等開盤):
+
+```bash
+sudo -u shioaji_svc bash -lc 'cd /home/shioaji_svc/txf-streaming-server && .venv/bin/python -m src.tools.verify_pipeline'
+```
+
+驗:shioaji 模型欄位是否還在(升版改名會被抓到)、protobuf 序列化、Kafka 投遞、
+**R2 路由**(`quote.code` 是真實月份碼非 `TXFR2`)、simtrade 過濾、位元組解得回原值。
+⚠️ 唯一驗不到的是「shioaji 是否真的以 1-arg 呼叫回調」——那需要真實行情。
+腳本會斷言測試 topic 與生產 topic 無交集,有交集直接拒跑。
 
 **驗收(下一個開盤日)**
 
