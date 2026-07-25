@@ -1,63 +1,54 @@
-# TXF Streaming Server
+# txf-streaming-server — 台指期即時行情 producer
 
-台指期 (TXF) 即時行情 producer:**Shioaji → Protobuf → Kafka**。
-以 Asyncio 連永豐 Shioaji API,將近月 (TXFR1) / 次月 (TXFR2) 台指期的 **Tick** 與 **BidAsk**
-經 Google Protobuf 序列化(價格採 ×10000 scaled int64)後即時推送到 Apache Kafka,
-供下游回測 / 看盤 / 戰情室消費。
+**Shioaji → Protobuf → Kafka**。以 Asyncio 連永豐 Shioaji API,把近月(TXFR1)/ 次月(TXFR2)
+台指期的 **Tick** 與 **BidAsk** 序列化後即時推進 Kafka,供下游看盤 / 戰情室消費。
 
-- **執行**:`python -m src.txf_producer`
-- **Shioaji**:1.7(`requirements.txt` 釘 `shioaji[speed]>=1.7.0`)
-- **部署**:Ubuntu + systemd,見 [部署](#部署-deployment)
+```
+永豐 Shioaji API
+   │
+   ├─（即時·本專案）→ txf-streaming-server ─Protobuf→ Kafka ─┬─→ txf-quant-platform（看盤/回測）
+   │                                                        └─→ txf-gale-engine（戰情室）
+   └─（歷史）→ txf-data-lake ──Polars──→ Parquet 資料湖 ────────→ txf-quant-platform
+```
 
----
+**Kafka 的消費者是 quant-platform 與 gale-engine**;`txf-data-lake` 走 Shioaji 歷史 API,不碰 Kafka。
 
-## 資料格式 (Wire Schema)
-
-Protobuf 3;價格欄位一律 **Scaled Integer(實際價 × 10000)**,還原時 ÷10000。
-`protos/txf_data.proto` 是**跨 repo 共用的 wire 契約**,改動會波及所有下游消費者。
-
-### Tick (`txf.Tick`)
-| Field | Type | 說明 |
-| :--- | :--- | :--- |
-| `code` | string | 商品代碼(如 `TXFH6`) |
-| `timestamp_ms` | int64 | Unix Epoch (ms) |
-| `close` | int64 | 成交價 ×10000 |
-| `volume` | int32 | 單筆量 |
-| `tick_type` | int32 | 1:外盤 / 2:內盤 |
-| `total_volume` | int32 | 當日總量(用於偵測封包遺漏) |
-| `underlying_price` | int64 | 標的價 ×10000 |
-
-### BidAsk (`txf.BidAsk`)
-| Field | Type | 說明 |
-| :--- | :--- | :--- |
-| `bid/ask_total_vol` | int32 | 委託總量 |
-| `bid/ask_price` | repeated int64 | 五檔價 ×10000 |
-| `bid/ask_volume` | repeated int32 | 五檔量 |
-| `diff_..._vol` | repeated int32 | 五檔掛單變化量(策略訊號用) |
-
-**Topic 路由**:TXFR1 tick → `txf-tick`、TXFR2 tick → `txfr2-tick`(R2 無 BidAsk)、TXFR1 BidAsk → `txf-bidask`。
+| | |
+|---|---|
+| **執行** | `python -m src.txf_producer`(必須是模組形式) |
+| **需求** | Python 3.13(`.python-version` 鎖定)、shioaji ≥ 1.7、一個 Kafka broker |
+| **部署** | Ubuntu + systemd + crontab,見 [第 3 節](#3-部署) |
 
 ---
 
-## 快速開始 (Quick Start)
+## 1. 要部署一整套?照這個順序
+
+| 順序 | 做什麼 | 看哪份文件 |
+|---|---|---|
+| 1️⃣ | **架 Kafka broker**(空白機器從零) | [`deploy/kafka/SETUP.md`](deploy/kafka/SETUP.md) |
+| 2️⃣ | **部署本專案**(producer) | 本文件第 2、3 節 |
+| 3️⃣ | 部署消費端(看盤 / 回測) | `txf-quant-platform` 的 README |
+| — | 歷史資料湖(獨立於 Kafka,可平行做) | `txf-data-lake` 的 README |
+
+> 目標機器**已經有 Kafka** 就跳過 1️⃣。
+
+---
+
+## 2. 安裝與設定
 
 ```bash
 git clone https://github.com/gman-quant/txf-streaming-server.git
 cd txf-streaming-server
 
-uv python install 3.13              # 首次:取得 .python-version 鎖定的 Python 3.13
-uv venv                             # 依 .python-version 建 venv(Python 3.13)
-. .venv/Scripts/activate            # Windows(mac/Linux:. .venv/bin/activate)
-uv pip install -r requirements.txt  # 精確重現既有環境用 requirements.lock
+uv python install 3.13              # 取得 .python-version 鎖定的 Python
+uv venv                             # 建 .venv
+uv pip install -r requirements.txt
 
-cp .env.example .env                # 填入 Shioaji 金鑰與 Kafka 位址(見下)
-
+cp .env.example .env && vi .env     # 填金鑰與 Kafka 位址(見下)
 python -m src.txf_producer
 ```
 
-### 設定 `.env`
-
-完整範本見 `.env.example`;關鍵欄位:
+### `.env`
 
 ```bash
 SHIOAJI_API_KEY=...
@@ -68,70 +59,111 @@ TICK_R2_TOPIC=txfr2-tick     #   缺 TICK_R2_TOPIC 會讓每筆 R2 tick 發送�
 BIDASK_TOPIC=txf-bidask
 ```
 
-### 重新編譯 Protobuf(僅在改了 `.proto` 時)
+> `.env` 含金鑰,已被 gitignore。**broker 位址是 per-machine 的,不要 commit。**
+
+### 驗證裝好了沒(不必等開盤)
+
+```bash
+python -m src.tools.verify_pipeline    # 合成報價跑完整條鏈,只寫測試 topic
+python -m src.tools.txf_consumer       # 即時解碼行情、量測延遲(需有行情)
+```
+
+`verify_pipeline` 會驗:shioaji 模型欄位、protobuf 序列化、Kafka 投遞、R2 路由、
+simtrade 過濾、位元組解得回原值。它**斷言測試 topic 與生產 topic 無交集**,有交集直接拒跑。
+
+---
+
+## 3. 部署
+
+Ubuntu systemd 背景服務 + crontab 隨 TAIFEX 時段自動啟停。
+unit 檔已含實測調校(CPU 綁核、OOM 保護、`SIGINT` graceful stop)。
+
+```bash
+sudo useradd -r -m -d /home/shioaji_svc shioaji_svc
+sudo cp deploy/txf-producer.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl start txf-producer
+journalctl -u txf-producer -f
+```
+
+要看到:`Login OK` → `Found Near/Next Month` → `Subscribed R1/R2` → `Service is running`。
+
+> ⚠️ **換機器必改 `deploy/txf-producer.service` 兩處:**
+> - **`CPUAffinity`** —— 要綁「同一顆實體核的兩個 HT 兄弟」,用
+>   `cat /sys/devices/system/cpu/cpu<N>/topology/thread_siblings_list` 查。
+>   只綁一個 = 另一個兄弟核的工作仍會來搶。(現值 `2 6` 是 i7-4770 的答案,別照抄到別台機器。)
+> - **`WorkingDirectory` / `ExecStart`** 路徑。
+
+### 交易時段排程(crontab)
+
+`systemctl enable` 是**不需要的** —— 啟停由 crontab 控制,不靠開機自啟。
+
+```cron
+40 08 * * 1-5 /bin/systemctl start txf-producer.service   # 日盤 08:45
+46 13 * * 1-5 /bin/systemctl stop  txf-producer.service   # 日盤收 13:45
+55 14 * * 1-5 /bin/systemctl start txf-producer.service   # 夜盤 15:00
+01 05 * * 2-6 /bin/systemctl stop  txf-producer.service   # 夜盤收 05:00
+```
+
+### 🔴 重啟的代價不對稱
+
+- `daemon-reload` → **零影響**,隨時可做
+- `restart` → 斷線幾秒,而且:
+  - **tick** 隔天可從 Shioaji 歷史 API 補回
+  - **bidask 只存在 Kafka,Shioaji 沒有歷史 API —— 斷幾秒就永久少幾秒**
+
+**→ 改設定隨時可做,重啟一律等收盤**(週六 05:00 後,或平日 13:45–15:00 盤間)。
+
+### 健康檢查
+
+systemd 只知道行程在不在,測不到「連得上但不再送 tick」(斷線重連失敗、訂閱掉了、
+回調在吞例外)。`deploy/check_feed_alive.sh` 檢查 topic offset 在交易時段內是否前進
+(掛法見腳本尾端)。**建議先只告警、觀察數日再開自動重啟** —— 誤判重啟會製造 bidask 破洞。
+
+---
+
+## 4. 資料格式(wire schema)
+
+Protobuf 3;價格一律 **Scaled Integer(實際價 × 10000)**,還原時 ÷10000。
+`protos/txf_data.proto` 是**跨 repo 共用的契約**,改動會波及所有下游消費者。
+
+### Tick (`txf.Tick`)
+| Field | Type | 說明 |
+| :--- | :--- | :--- |
+| `code` | string | 商品代碼(如 `TXFH6`) |
+| `timestamp_ms` | int64 | Unix Epoch (ms) |
+| `close` | int64 | 成交價 ×10000 |
+| `volume` | int32 | 單筆量 |
+| `tick_type` | int32 | 1:外盤 / 2:內盤 |
+| `total_volume` | int32 | 當日總量(可用來偵測封包遺漏) |
+| `underlying_price` | int64 | 標的價 ×10000 |
+
+### BidAsk (`txf.BidAsk`)
+| Field | Type | 說明 |
+| :--- | :--- | :--- |
+| `bid/ask_total_vol` | int32 | 委託總量 |
+| `bid/ask_price` | repeated int64 | 五檔價 ×10000 |
+| `bid/ask_volume` | repeated int32 | 五檔量 |
+| `diff_..._vol` | repeated int32 | 五檔掛單變化量 |
+
+**Topic 路由**:TXFR1 tick → `txf-tick`、TXFR2 tick → `txfr2-tick`(R2 無 BidAsk)、
+TXFR1 BidAsk → `txf-bidask`。
+
+> R2 的 `quote.code` 是**真實月份碼**(如 `TXFI6`)不是 `"TXFR2"`,路由要同時比對
+> `target_code` —— 這是修過的 bug,別退回。
+
+### 改了 `.proto` 之後
 
 ```bash
 python -m grpc_tools.protoc -I protos --python_out=src protos/txf_data.proto
 ```
 
-### 除錯工具:Kafka Console Inspector
-
-即時 consume 並解碼行情、拆解傳輸/處理延遲,用來檢查串流是否正常:
-
-```bash
-python -m src.tools.txf_consumer
-```
-
 ---
 
-## 部署 (Deployment)
+## 5. 效能
 
-Ubuntu systemd 背景服務,配合 crontab 隨 TAIFEX 時段自動啟停。
-unit 檔已含實測調校(CPU 綁核、OOM 保護、`SIGINT` graceful stop),見 `deploy/txf-producer.service`。
+**真實負載**(近 25 個交易日實測):單日約 **73,000 筆**、單秒峰值 **479 筆/秒**。
 
-```bash
-# 新主機重建(git clone → 可運作)
-git clone https://github.com/gman-quant/txf-streaming-server.git
-cd txf-streaming-server
-cp .env.example .env && vi .env
-uv python install 3.13 && uv venv && uv pip install -r requirements.txt   # .python-version 鎖 Python 3.13
-
-sudo useradd -r -m -d /home/shioaji_svc shioaji_svc
-sudo cp deploy/txf-producer.service /etc/systemd/system/
-sudo systemctl daemon-reload && sudo systemctl enable --now txf-producer
-journalctl -u txf-producer -f
-```
-
-> ⚠️ 換機器要檢查 `deploy/txf-producer.service` 兩處:
-> - **`CPUAffinity`** —— 要綁「同一實體核的 HT 兄弟」那兩個邏輯核(用
->   `cat /sys/devices/system/cpu/cpu<N>/topology/thread_siblings_list` 查);unit 已設 `2 6`(本機 i7-4770,無需再改)。只綁一個核 = 另一個 HT 兄弟仍會來搶。
-> - **`WorkingDirectory` / `ExecStart`** 路徑。
->
-> Kafka 從零建置見 `deploy/kafka/SETUP.md`;若目標機**已有 Kafka**(如既有生產機),略過該文件。
-
-### 交易時段排程 (crontab)
-
-```cron
-# Day    08:40 start / 13:46 stop
-40 08 * * 1-5 /bin/systemctl start txf-producer.service
-46 13 * * 1-5 /bin/systemctl stop  txf-producer.service
-# Night  14:55 start / (次日) 05:01 stop
-55 14 * * 1-5 /bin/systemctl start txf-producer.service
-01 05 * * 2-6 /bin/systemctl stop  txf-producer.service
-```
-
-### 健康檢查
-
-systemd 只知道行程在不在,測不到「連得上但不再送 tick」(斷線重連失敗、訂閱掉了)。
-`deploy/check_feed_alive.sh` 檢查 topic offset 是否在交易時段內前進(掛法見腳本尾端)。
-
----
-
-## 效能
-
-**真實負載**(近 25 個交易日實測):單日約 **73,000 筆**、單秒峰值 **479 筆/秒**(2026-07-09)。
-
-**本地處理成本**(dev 鏡像實測;protobuf 訊息 Tick 33 B / BidAsk 118 B):
+**本地處理成本**(protobuf 訊息 Tick 33 B / BidAsk 118 B):
 
 | 路徑 | 每則成本 |
 | :--- | :--- |
@@ -139,15 +171,13 @@ systemd 只知道行程在不在,測不到「連得上但不再送 tick」(斷�
 | producer build + serialize(BidAsk・五檔) | ~12.7 µs |
 | consumer decode(Tick / BidAsk) | ~1.2 / 1.8 µs |
 
-即使最壞情況(峰值全為較重的 BidAsk),producer 序列化在 479 筆/秒下僅佔
-**約 0.6 % 的一顆核心** —— **本地 CPU 不是瓶頸**。
+即使峰值全為較重的 BidAsk,序列化也只佔**約 0.6% 的一顆核心** —— **本地 CPU 不是瓶頸**。
 
-**真正的約束是上游網路延遲**:Shioaji → 伺服器實測平均 **5.7 ms**
-(於生產機量測、30 次取樣、0 % 封包遺漏),比本地處理大三個數量級,且本程式無法改變它;
-producer 能做的是「不成為額外瓶頸」,上表已確認。
+**真正的約束是上游網路延遲**:Shioaji → 伺服器實測平均 **5.7 ms**(30 次取樣、0% 遺漏),
+比本地處理大三個數量級,且本程式改變不了它。producer 能做的是「不成為額外瓶頸」,上表已確認。
 
 > 本段**刻意不宣稱吞吐上限**。早期一組「53.8 萬 msg/s」的 benchmark 已移除 ——
-> 在一個有數百倍餘裕的維度上,再漂亮的數字都不改變任何決策。取捨理由詳見 `CLAUDE.md`。
+> 在一個有數百倍餘裕的維度上,再漂亮的數字都不改變任何決策。理由詳見 `CLAUDE.md`。
 
 ![server status](pic/1.png)
 
@@ -155,5 +185,5 @@ producer 能做的是「不成為額外瓶頸」,上表已確認。
 
 ## Disclaimer
 
-本專案供程式交易研究與教育用途。高頻交易風險極高,API 連線不穩、報價延遲或系統故障
-皆可能造成損失,使用者需自行承擔。
+本專案供程式交易研究與教育用途。API 連線不穩、報價延遲或系統故障皆可能造成損失,
+使用者需自行承擔。

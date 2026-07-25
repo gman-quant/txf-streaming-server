@@ -1,6 +1,8 @@
 # txf-streaming-server — AI Agent 指南
 
-Live 行情 producer:Shioaji → Protobuf → Kafka。**生產環境在 Ubuntu 192.168.1.50**(systemd `txf-producer.service` + crontab 隨 TAIFEX 時段啟停);這個 Windows checkout 是開發鏡像。下游四個消費者:txf-quant-platform/stable(txf-tick、txfr2-tick)、txf-gale-engine(txf-tick、txf-bidask)、txf-data-lake(kafka_reader 回補)。
+Live 行情 producer:Shioaji → Protobuf → Kafka。**生產環境在 Ubuntu 192.168.1.50**(systemd `txf-producer.service` + crontab 隨 TAIFEX 時段啟停);這個 Windows checkout 是開發鏡像。下游消費者:txf-quant-platform/stable(txf-tick、txfr2-tick)、txf-gale-engine(txf-tick、txf-bidask)。
+⚠️ **txf-data-lake 已不是 Kafka 消費者**(`core/kafka_reader` 於 2026-07-21 隨舊看盤一併刪除,
+自此純走 Shioaji 歷史 API)——舊文件說「四個消費者」是過期的。
 
 ## 紅線
 
