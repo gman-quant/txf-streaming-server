@@ -224,6 +224,33 @@ def _offset_time(c: Consumer, topic: str, offset: int) -> int:
 # ══════════════════════════════════════════════════════════════════════════
 # Tier 2 —— profile(消費指定一天)
 # ══════════════════════════════════════════════════════════════════════════
+def _sliding_max(stamps: list[int], window_ms: int) -> int:
+    """任意 window_ms 視窗內的**最大訊息數**(滑動,非固定桶)。
+
+    為什麼不用固定桶:對齊整秒的桶會把跨邊界的爆量切成兩半而低估峰值
+    (例如某秒後半 300 則 + 下一秒前半 300 則,固定桶只會看到兩個 300,
+    滑動視窗才會抓到真正的 600)。固定桶的值是**下界**,滑動才是真實觀測最大。
+    """
+    if not stamps:
+        return 0
+    st = sorted(stamps)
+    best = 0
+    i = 0
+    for j in range(len(st)):
+        while st[j] - st[i] >= window_ms:
+            i += 1
+        best = max(best, j - i + 1)
+    return best
+
+
+def _fixed_buckets(stamps: list[int], width_ms: int) -> dict[int, int]:
+    """對齊的固定桶計數(供對照用;真實峰值請看 _sliding_max)。"""
+    out: dict[int, int] = defaultdict(int)
+    for t in stamps:
+        out[t // width_ms] += 1
+    return out
+
+
 def _pct(sorted_vals: list[int], p: float) -> int:
     if not sorted_vals:
         return 0
@@ -262,7 +289,8 @@ def cmd_profile(args) -> int:
             c.assign([TopicPartition(topic, 0, begin)])
             is_tick = topic != "txf-bidask"
 
-            buckets: dict[int, int] = defaultdict(int)     # 100ms 桶
+            stamps: list[int] = []                         # produce 時間戳(算 producer 承受速率)
+            ex_stamps: list[int] = []                      # 交易所時間戳(算市場爆量速率)
             lat: list[int] = []                            # 延遲(ms)
             n = 0
             t0 = time.time()
@@ -277,7 +305,7 @@ def cmd_profile(args) -> int:
                 if kts >= end_ms:
                     break
                 n += 1
-                buckets[kts // 100] += 1
+                stamps.append(kts)
 
                 if is_tick:
                     t = txf_data_pb2.Tick()
@@ -290,24 +318,25 @@ def cmd_profile(args) -> int:
 
                 if payload_ms > 0:
                     lat.append(kts - payload_ms)
+                    ex_stamps.append(payload_ms)
 
             elapsed = time.time() - t0
             print(f"   讀完 {_fmt(n)} 則 / {elapsed:.1f}s")
 
             # 瞬時峰值
-            if buckets:
-                vals = sorted(buckets.values(), reverse=True)
-                top100 = vals[0]
-                # 由 100ms 桶推每秒(同一秒的十個桶相加)
-                per_sec: dict[int, int] = defaultdict(int)
-                for b100, cnt in buckets.items():
-                    per_sec[b100 // 10] += cnt
-                sec_vals = sorted(per_sec.values(), reverse=True)
-                print(f"   瞬時峰值:100ms 桶最大 {top100} 則 "
-                      f"(= 瞬時 {top100*10:,}/秒)")
-                print(f"             每秒最大 {sec_vals[0]:,}/秒,"
-                      f"p99 {_pct(sorted(per_sec.values()), 0.99):,}/秒,"
-                      f"平均 {n/max(1,len(per_sec)):.0f}/秒(僅計有資料的秒)")
+            if stamps:
+                slide = _sliding_max(stamps, 1000)
+                fixed = sorted(_fixed_buckets(stamps, 1000).values(), reverse=True)
+                print(f"   峰值(滑動 1 秒視窗,真實觀測最大):{slide:,} 則/秒")
+                print(f"        固定 1 秒桶最大 {fixed[0]:,}/秒 "
+                      f"(對齊整秒,爆量跨邊界會被切半 → 這是下界)")
+                print(f"        滑動 100ms 最大 {_sliding_max(stamps, 100):,} 則")
+                if ex_stamps:
+                    # 同一批訊息改用**交易所時間**分桶 = 市場真正的爆量速率。
+                    # produce 時間會被鏈路延遲抖動抹平(p50 就有上百 ms),
+                    # 兩個數字問的是不同問題:producer 要扛多少 vs 市場多快。
+                    print(f"        [依交易所時間] 滑動 1 秒最大 "
+                          f"{_sliding_max(ex_stamps, 1000):,} 則/秒 = 市場爆量速率")
 
             # 延遲
             if lat:
@@ -320,7 +349,12 @@ def cmd_profile(args) -> int:
                     print(f"   ⚠️ 有 {neg} 則延遲為負 → 時鐘不同步或交易所時間戳有偏移,"
                           f"延遲數字不可信")
 
-            all_sec[topic] = per_sec
+            # 🔴 只在真的有資料時寫入。原本 per_sec 定義在 `if buckets:` 內,
+            #    0 則訊息的 topic 不會重新賦值 → 沿用**上一個 topic** 的資料,
+            #    合計時被重複計算(2026-07-25 實錯:合計報 469/秒 = 153+153+163,
+            #    而 tick+bidask 各自最大僅 153 與 163,合計不可能超過 316)。
+            if stamps:
+                all_sec[topic] = stamps
             print()
         finally:
             c.close()
@@ -328,14 +362,13 @@ def cmd_profile(args) -> int:
     # 跨 topic 合計的瞬時峰值 —— producer 是**單一行程**同時扛三條流,
     # 各 topic 分開看會低估它真正要吞的速率。
     if len(all_sec) > 1:
-        merged: dict[int, int] = defaultdict(int)
-        for per_sec in all_sec.values():
-            for s, cnt in per_sec.items():
-                merged[s] += cnt
-        vals = sorted(merged.values())
+        merged_stamps = sorted(x for v in all_sec.values() for x in v)
+        per_sec_fixed = sorted(_fixed_buckets(merged_stamps, 1000).values())
         print("── 全 topic 合計(producer 實際承受的速率)" + "─" * 24)
-        print(f"   每秒最大 {vals[-1]:,}/秒  p99 {_pct(vals,0.99):,}/秒  "
-              f"p50 {_pct(vals,0.50):,}/秒")
+        print(f"   峰值(滑動 1 秒):{_sliding_max(merged_stamps, 1000):,} 則/秒")
+        print(f"   固定 1 秒桶:最大 {per_sec_fixed[-1]:,}  "
+              f"p99 {_pct(per_sec_fixed,0.99):,}  p50 {_pct(per_sec_fixed,0.50):,} /秒")
+        print(f"   滑動 100ms 最大:{_sliding_max(merged_stamps, 100):,} 則")
         print()
 
     print("💡 完整性驗證請跑:")
