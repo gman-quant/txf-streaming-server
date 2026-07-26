@@ -1,6 +1,6 @@
 # txf-streaming-server — AI Agent 指南
 
-Live 行情 producer:Shioaji → Protobuf → Kafka。**生產環境在 Ubuntu 192.168.1.50**(systemd `txf-producer.service` + crontab 隨 TAIFEX 時段啟停);這個 Windows checkout 是開發鏡像。下游消費者:txf-quant-platform/stable(txf-tick、txfr2-tick)、txf-gale-engine(txf-tick、txf-bidask)。
+Live 行情 producer:Shioaji → Protobuf(看盤線)+ JSON(研究線)→ Kafka。**生產環境在 Ubuntu 192.168.1.50**(systemd `txf-producer.service` + crontab 隨 TAIFEX 時段啟停);這個 Windows checkout 是開發鏡像。下游消費者:txf-quant-platform/stable(txf-tick、txfr2-tick)、txf-gale-engine(txf-tick、txf-bidask)。
 ⚠️ **txf-data-lake 已不是 Kafka 消費者**(`core/kafka_reader` 於 2026-07-21 隨舊看盤一併刪除,
 自此純走 Shioaji 歷史 API)——舊文件說「四個消費者」是過期的。
 
@@ -14,8 +14,23 @@ Live 行情 producer:Shioaji → Protobuf → Kafka。**生產環境在 Ubuntu 1
 ## 事實
 
 - 執行必須是模組形式:`python -m src.txf_producer`(相對 import;直接跑檔案會 ImportError)。venv Python 3.13(uv 管理,`.python-version` 鎖定)。
-- Topic 路由:TXFR1 tick→txf-tick、TXFR2 tick→txfr2-tick(**R2 無 BidAsk**)、R1 BidAsk→txf-bidask。R2 的 quote.code 是真實合約碼(如 TXFG6)非 "TXFR2",路由要同時比對 target_code(commit 6441f48 修的 bug,別退回)。
-- simtrade==1(試撮)事件被過濾,不進 Kafka。
+- Topic 路由(**2026-07-26 改版**):
+  | 來源 | topic | 格式 | 消費者 |
+  |---|---|---|---|
+  | R1 tick | `txf-tick` | protobuf | platform/stable viewer、gale |
+  | R2 tick | `txfr2-tick` | protobuf | platform/stable viewer |
+  | **R1** BidAsk | `txf-bidask` | protobuf | gale(匯出 `{date}_TXF_bidask.parquet`) |
+  | **R2 BidAsk + R1/R2 Quote** | **`txf-md-raw`** | **JSON(orjson)** | 待寫的匯出器 |
+
+  ⚠️ **R2 的 BidAsk 絕對不可進 `txf-bidask`** —— gale 匯出時不依 code 過濾,混進去會污染 R1 的檔。分流在 `process_bidask()` 開頭 early-return。
+  ⚠️ R2 的 quote.code 是真實合約碼(如 TXFI6)非 "TXFR2",判定要同時比對 target_code(commit 6441f48 修的 bug,別退回)—— 已抽成 `_is_r2()`。
+  ⚠️ **訂閱順序刻意讓 Quote 排在 Tick/BidAsk 之前**:同一合約同時訂三種型別,Shioaji **無文件**說明後訂的會不會覆蓋前面的。Quote 放最前面,最壞情況只是拿不到 Quote(研究線缺料);放最後則可能踢掉 Tick → viewer 沒行情。**別調換順序。**
+- simtrade==1(試撮)**只在 protobuf 路徑被過濾**;`txf-md-raw` **刻意保留試撮**(欄位在,要濾隨時能濾)。試撮是歷史 API 完全沒有的資料:日盤 08:30–08:45、夜盤 14:50–15:00,每 5 秒一則(量體極小,約 180 則/商品/盤)。
+- `txf-md-raw` 的設計原則:**`to_dict()` 全欄位、不挑、不改精度**。代價已經付過 —— protobuf 的 BidAsk 漏了 `first_derived_*`(衍生一檔=組合簿的唯一入口)整整八個月,而 bidask 無歷史 API、補不回來。用 **orjson** 是因為它回傳 bytes 且**原生保留 datetime 微秒**(protobuf 路徑的 `int(ts*1000)` 把微秒截掉了;交易所 `INFORMATION-TIME` 其實給到微秒)。附加欄位 `_type` / `_role`(R1/R2,因為 code 會隨換月變)/ `_recv_ns` / `_seq`。
+  ⚠️ `raw_json_default` **刻意嚴格**(只認 `.value` 枚舉與 Decimal,其餘 raise)—— 別改成 `default=str`,那會讓 Shioaji 改型別時靜默產生怪資料。
+  ⚠️ `_emit_raw` **絕不 re-raise**:例外冒回 Shioaji 回調執行緒可能讓該回調永久靜默停止。錯誤只計數 + 每 500 次節流 log。
+- **`enable.idempotence=True`(2026-07-26 新增)**:原本 `acks=1` + 未設 idempotence + `max.in.flight` 預設 1000000 + retries 極大 → 暫時性錯誤重試時**分區內可能亂序**(librdkafka 明確警告)。本 broker **RF=1**,故 idempotence 強制的 `acks=all` 等同 `acks=1`,**延遲代價為零**。
+  ⚠️ 但 Kafka offset 的順序只保證「`produce()` 被呼叫的順序」,**跨訂閱流(R1 vs R2、tick vs bidask vs quote)並不可靠** —— 三個回調分開派發、Shioaji 無排序文件。交易所的 `PROD-MSG-SEQ`(跨 I024/I081/I083 連續的商品序號)Shioaji 沒轉出來,**拿不到**。這是 order-flow 研究的天花板,價差研究(秒~分尺度)不受影響。
 - producer.poll(0) 刻意移到 100ms 背景任務 —— **別加回熱路徑**(GIL 阻塞,commit 0ad6332 的刻意移除)。
 - 下游假設 topic **單一 partition**(data-lake kafka_reader 硬編 TopicPartition(topic, 0))。
 - protobuf 重生成:`python -m grpc_tools.protoc -I protos --python_out=src protos/txf_data.proto`(生成檔是 committed 的,重生成會出現 tracked diff)。
@@ -67,9 +82,19 @@ confluent-kafka 2.15.0 / grpcio 1.83.0 / uvloop 0.22.1。依賴由 **uv** 管理
 | `txf-tick` | 365 天 | 10 GB | 1.2 GB | 2025-12-01 |
 | `txf-bidask` | 365 天 | **20 GB** | **12 GB** | 2025-12-01 |
 | `txfr2-tick` | 365 天 | 1 GB | 14 MB | 2026-06-15(雙 topic 上線日) |
+| `txf-md-raw` | **30 天** | **-1(無閘)** | — | 2026-07-27(預計) |
 
-**兩道閘先到先砍。** `txf-bidask` 約 52 MB/天 → 一年約 19 GB,**逼近 20 GB 上限**;
-成交量一放大,**大小閘會先砍掉還沒滿一年的資料,而且是靜默的**。`txf-tick` 則很寬鬆。
+**兩道閘先到先砍。** `txf-bidask` 約 52 MB/天 → 大小閘約 5 個月後會先觸發,
+**先砍掉還沒滿一年的資料,而且是靜默的** —— 所以「保留 365 天」其實做不到。
+⚠️ 但 2026-07-26 查證:**parquet 匯出 163/163 天零缺口**(`*_bidask.parquet` 合計 891 MB
+vs Kafka 12 GB → **zstd 壓縮比 13.5×**)。既然 parquet 才是檔案庫、Kafka 只是緩衝,
+`txf-bidask` 存 365 天/20 GB 是**過度配置**;正確方向是**縮短**(待新匯出器上線後改 60 天),
+不是放寬。現況雖然設定與意圖不符,但**不會掉資料**。
+
+**磁碟位置(2026-07-26 實查)**:`log.dirs=/opt/kafka/data/kraft-combined-logs` → 掛在 `/`
+→ `sda`(**SanDisk SSD**,232 G,可用 **198 G**)。那顆 1 TB 的 `sdb` 是
+**ST1000DM003 = 7200rpm 機械碟**,掛在 `/mnt/data`(給 `txf-backup` 用)。
+**別把 Kafka 搬到 sdb** —— 那是 SSD → HDD 的降級,而且 SSD 的 198 G 已是十年份。
 
 ### ⚠️ 重啟的不對稱代價
 

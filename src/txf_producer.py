@@ -32,20 +32,22 @@ import signal
 import time
 import asyncio
 import logging
+import itertools
 from decimal import Decimal
 from typing import Optional
 
 # --- Third-party Imports ---
 import shioaji as sj
-from shioaji import TickFOPv1, BidAskFOPv1
+import orjson
+from shioaji import TickFOPv1, BidAskFOPv1, QuoteFOPv1
 from confluent_kafka import Producer
 
 # --- Local Imports ---
 from . import txf_data_pb2
 from .config import (
-    SHIOAJI_API_KEY, SHIOAJI_SECRET_KEY, 
-    KAFKA_BOOTSTRAP_SERVERS, 
-    TICK_TOPIC, TICK_R2_TOPIC, BIDASK_TOPIC
+    SHIOAJI_API_KEY, SHIOAJI_SECRET_KEY,
+    KAFKA_BOOTSTRAP_SERVERS,
+    TICK_TOPIC, TICK_R2_TOPIC, BIDASK_TOPIC, MD_RAW_TOPIC
 )
 
 # ==========================================
@@ -75,6 +77,27 @@ logger = setup_logging()
 SCALE = 10000
 FATAL_CODES = {1, 2, 8}
 
+# raw topic 的錯誤 log 節流:每 N 次才印一次。
+# 為什麼要節流:若某型別的 quote 每則都序列化失敗,逐則 log 會刷爆 journalctl 與磁碟。
+RAW_ERR_LOG_EVERY = 500
+
+
+def raw_json_default(o):
+    """orjson 的 fallback —— **刻意嚴格**。
+
+    只認「有 .value 的枚舉」(shioaji 的 Exchange 等走自家 EnumMixin,不是 enum.Enum,
+    所以用 duck-typing 而非 isinstance)與 Decimal;其餘一律 raise。
+
+    ⚠ 絕不寫成 `default=str`:那會把任何沒預期到的型別悄悄變成字串,
+      Shioaji 改型別時我們不會知道。寧可大聲失敗(且失敗被 _emit_raw 接住並計數)。
+    """
+    v = getattr(o, "value", None)
+    if isinstance(v, (str, int, float)):
+        return v
+    if isinstance(o, Decimal):
+        return str(o)
+    raise TypeError(f"unserializable type in raw payload: {type(o).__name__}")
+
 # ==========================================
 # 2. Core Service Class
 # ==========================================
@@ -97,15 +120,34 @@ class TxfStreamingService:
         self.contract_r2 = None
         self.running = False
         self._loop = None
+        # raw topic 用:producer 自己的單調序號 + 錯誤計數。
+        # _raw_seq 記錄「**producer 觀察到的順序**」——不是交易所的順序。
+        # 交易所的 PROD-MSG-SEQ(跨 I024/I081/I083 連續)Shioaji 沒有轉出來,拿不到;
+        # 這個序號的價值是「比 Kafka offset 更早、不受 librdkafka 重試影響」,
+        # 兩者都記下來,日後若不一致查得出是哪一層造成的。
+        # next() 對 itertools.count 是 C 層操作,GIL 下原子,不需要鎖。
+        self._raw_seq = itertools.count()
+        self._raw_err = 0
 
     def _init_kafka(self):
         """初始化 Kafka Producer"""
+        if not MD_RAW_TOPIC:
+            logger.critical("❌ MD_RAW_TOPIC 未設定(.env 或 config 預設值都沒給)")
+            sys.exit(1)
         kafka_conf = {
             'bootstrap.servers': KAFKA_BOOTSTRAP_SERVERS,
             'client.id': 'txf-producer-hft',
 
             # --- HFT 速度核心參數（極限優化版） ---
-            'acks': '1',                           # 等待 Leader 確認，兼顧低延遲與防漏資料
+            # 2026-07-26:啟用 idempotence 修正「分區內可能亂序」的既有缺陷。
+            #   原設定 acks=1 + 未設 enable.idempotence + max.in.flight 預設 1000000 +
+            #   retries 預設極大 → 暫時性錯誤觸發重試時,**早的批次可能落在晚的批次之後**
+            #   (librdkafka 明確警告的情況)。txf-tick / txf-bidask 同樣受影響。
+            # 代價:idempotence 會強制 acks=all。但本 broker **ReplicationFactor=1**
+            #   (2026-07-26 實查)→ 只有 leader、沒有 follower,acks=all 等於 acks=1,
+            #   延遲代價實質為零。
+            'enable.idempotence': True,
+            'acks': 'all',                         # idempotence 要求;RF=1 下等同 acks=1
             'linger.ms': 0,                        # 零延遲，有數據立刻發送
             'compression.type': 'none',            # [修改] 停用壓縮！區網頻寬富裕，拒絕消耗 CPU 計算壓縮
             'socket.nagle.disable': True,          # [修改] 關閉 Nagle 演算法，網卡層零等待立即發射
@@ -139,7 +181,65 @@ class TxfStreamingService:
         """
         return int(val * SCALE) if val is not None else 0
 
+    # --- Raw(完整行情)輔助 ---
+
+    def _is_r2(self, code: str) -> bool:
+        """判定 quote 是否為次月。
+
+        ⚠ quote.code 是**真實合約碼**(如 TXFI6)不是 'TXFR2',所以必須同時比對
+          target_code —— 這是 commit 6441f48 修過的 bug,別退回成單一比對。
+        """
+        r2 = self.contract_r2
+        if not r2:
+            return False
+        return code in (r2.code, getattr(r2, "target_code", ""))
+
+    def _emit_raw(self, kind: str, quote, role: str) -> None:
+        """把 Shioaji 原始行情物件**完整**送進 raw topic(JSON)。
+
+        設計原則(2026-07-26):**不挑欄位、不改精度、不過濾 simtrade**。
+          · 挑欄位的代價已經付過 —— proto 的 BidAsk 漏了 first_derived_*(衍生一檔,
+            組合簿的唯一入口)整整八個月,而 bidask 沒有歷史 API,補不回來。
+            唯一結構上的解法是 to_dict() 全收。
+          · orjson 而非 json:回傳 bytes(Kafka 直接吃)且**原生把 datetime 序列化成
+            RFC 3339 含微秒** —— 舊的 proto 路徑 int(ts*1000) 把微秒截掉了,
+            交易所的 INFORMATION-TIME 其實給到微秒。
+          · 不過濾 simtrade:試撮(日盤 08:30–08:45、夜盤 14:50–15:00,每 5 秒一則)
+            是歷史 API 完全沒有的資料。欄位保留著,要濾隨時能濾。
+
+        附加欄位一律 `_` 前綴,避免與 Shioaji 欄位名相撞。
+        """
+        try:
+            payload = quote.to_dict()
+            payload["_type"] = kind          # tick / bidask / quote
+            payload["_role"] = role          # R1 / R2 —— code 會隨換月變,role 不會
+            payload["_recv_ns"] = time.time_ns()
+            payload["_seq"] = next(self._raw_seq)
+            self.producer.produce(
+                MD_RAW_TOPIC,
+                key=str(payload.get("code") or role).encode("utf-8"),
+                value=orjson.dumps(payload, default=raw_json_default),
+                on_delivery=self._delivery_report,
+            )
+        except Exception as e:
+            # ⚠ **絕不 re-raise**:例外若冒回 Shioaji 的回調執行緒,可能讓該回調
+            #   永久停止(SDK 未必重新註冊),而且是靜默的。這裡只計數 + 節流 log。
+            self._raw_err += 1
+            if self._raw_err % RAW_ERR_LOG_EVERY == 1:
+                logger.error(f"❌ Raw emit error #{self._raw_err} ({kind}/{role}): {e}")
+
     # --- Data Processing Callbacks ---
+
+    def process_quote(self, quote: QuoteFOPv1):
+        """Quote(QUO/v2,tick+bidask 合併)→ **只**進 raw topic,不碰任何 proto topic。
+
+        QuoteFOPv1 在資訊上是 TickFOPv1 ∪ BidAskFOPv1 的超集:
+        含 first_derived_* ×4、bid/ask_side_total_cnt(另兩者都沒有),
+        缺的 bid_total_vol/ask_total_vol 實測 100% 等於五檔加總(544,067 列)= 純冗餘。
+        尚未確認的是**觸發節奏**(委託簿變動就發 ≈544k/日,或成交才發 ≈87k/日)——
+        錄一天資料就能判定。
+        """
+        self._emit_raw("quote", quote, "R2" if self._is_r2(quote.code) else "R1")
 
     def process_tick(self, quote: TickFOPv1):
         """處理 Tick 並推送到 Kafka"""
@@ -174,6 +274,15 @@ class TxfStreamingService:
 
     def process_bidask(self, quote: BidAskFOPv1):
         """處理 BidAsk 並推送到 Kafka"""
+        # 2026-07-26:新增 R2 BidAsk 訂閱後,R2 的訊息也會走進這個回調。
+        # ⚠⚠ R2 **絕對不可以**進 BIDASK_TOPIC(txf-bidask)——
+        #     那個 topic 是 gale-engine 匯出 `{date}_TXF_bidask.parquet` 的來源,
+        #     且匯出時**不依 code 過濾**,混進 R2 會直接污染 R1 的檔。
+        #     R2 只進 raw topic,然後 return。以下 R1 的原有邏輯一行未改。
+        if self._is_r2(quote.code):
+            self._emit_raw("bidask", quote, "R2")
+            return
+
         try:
             if quote.simtrade == 1: return
 
@@ -275,6 +384,7 @@ class TxfStreamingService:
         # 綁定數據回調 (直接綁定方法，不需額外裝飾器)
         self.api.set_on_tick_fop_v1_callback(self.process_tick)
         self.api.set_on_bidask_fop_v1_callback(self.process_bidask)
+        self.api.set_on_quote_fop_v1_callback(self.process_quote)
 
         # 訂閱
         logger.info("⏳ Looking for TXF contracts...")
@@ -322,18 +432,30 @@ class TxfStreamingService:
         if hasattr(self.contract_r1, 'delivery_month'):
             r1_desc += f" [Delivery: {self.contract_r1.delivery_month}]"
             
+        # ⚠ 訂閱順序刻意讓 **Quote 排在 Tick/BidAsk 之前**。
+        #   原因:同一合約同時訂 Tick + BidAsk + Quote,Shioaji **沒有任何文件**說明
+        #   後訂的會不會覆蓋前面的。若真的會覆蓋,「Quote 最後訂」的下場是
+        #   Tick 被踢掉 → txf-tick 斷 → viewer 直接沒行情(真錢工具)。
+        #   反過來把 Quote 放最前面,最壞情況只是拿不到 Quote(研究線少一份資料,無害)。
+        #   ⇒ 失敗模式從「看盤瞎掉」降級為「研究資料缺一項」。實測後可再調整。
+        self.api.subscribe(self.contract_r1, quote_type=sj.QuoteType.Quote)
         self.api.subscribe(self.contract_r1, quote_type=sj.QuoteType.Tick)
         self.api.subscribe(self.contract_r1, quote_type=sj.QuoteType.BidAsk)
-        logger.info(f"✅ Subscribed R1 (Tick + BidAsk): {r1_desc}")
-        
+        logger.info(f"✅ Subscribed R1 (Quote + Tick + BidAsk): {r1_desc}")
+
         if self.contract_r2:
             r2_desc = f"{self.contract_r2.name} ({self.contract_r2.code})"
             if hasattr(self.contract_r2, 'delivery_month'):
                 r2_desc += f" [Delivery: {self.contract_r2.delivery_month}]"
-                
+
+            self.api.subscribe(self.contract_r2, quote_type=sj.QuoteType.Quote)
             self.api.subscribe(self.contract_r2, quote_type=sj.QuoteType.Tick)
-            logger.info(f"✅ Subscribed R2 (Tick only): {r2_desc}")
-        
+            # R2 BidAsk(2026-07-26 新增):次月委託簿 + 衍生一檔的唯一來源。
+            # 只進 raw topic —— 路由在 process_bidask 的開頭。
+            self.api.subscribe(self.contract_r2, quote_type=sj.QuoteType.BidAsk)
+            logger.info(f"✅ Subscribed R2 (Quote + Tick + BidAsk): {r2_desc}")
+
+        logger.info(f"📡 Raw topic: {MD_RAW_TOPIC} (quote×2 + R2 bidask, 完整 JSON)")
         self.running = True
 
     def shutdown(self):
