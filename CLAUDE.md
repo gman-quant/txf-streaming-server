@@ -53,12 +53,17 @@ confluent-kafka 2.15.0 / grpcio 1.83.0 / uvloop 0.22.1。依賴由 **uv** 管理
 
 | 時間 | 動作 | 對應 |
 |---|---|---|
-| 08:40 一–五 | start | 日盤 08:45 |
+| **08:28** 一–五 | start | 日盤 08:45,**提早吃 08:30–08:45 試撮** |
 | 13:46 一–五 | stop | 日盤收 13:45 |
-| 14:55 一–五 | start | 夜盤 15:00 |
+| **14:48** 一–五 | start | 夜盤 15:00,**提早吃 14:50–15:00 試撮** |
 | 05:01 二–六 | stop | 夜盤收 05:00 |
 
-→ 週末整段不跑。**要動生產機,週六是最安全的窗口**(服務本來就 inactive,零 bidask 破洞風險)。
+→ 週末整段不跑。**要動生產機,週六/週日是最安全的窗口**(服務本來就 inactive,零 bidask 破洞風險)。
+
+⚠️ **啟動時間於 2026-07-26 提早**(原 08:40 / 14:55):試撮只進 `txf-md-raw`
+(protobuf 路徑仍過濾 `simtrade`,viewer 完全不受影響)。
+已確認 `check_feed_alive.sh` 的 `in_session()` 排除 `05:00–08:45` 與 `13:45–15:00`,
+**提早啟動不會造成誤報**(副作用:試撮期的斷線健康檢查也看不到,要自己看資料)。
 
 ### ⚠️ 部署方式:2026-07-25 起改為 `git clone`,舊的「手動複製」已終結
 
@@ -67,6 +72,23 @@ confluent-kafka 2.15.0 / grpcio 1.83.0 / uvloop 0.22.1。依賴由 **uv** 管理
 `sudo -u shioaji_svc bash -lc 'cd /home/shioaji_svc/txf-streaming-server && git log --oneline -1'`
 2026-07-21 之前的舊狀態(`.git` 停在 `a5dfdec` 但檔案是手動複製的較新版)已不再適用。
 `.env.example` 與 `deploy/txf-producer.service` 都在 repo 內,新主機 clone 就重建得出來。
+
+### ⚠️ 2026-07-26:`orjson` 是新的直接依賴,舊環境要手動裝
+
+`txf-md-raw` 用 orjson 序列化,而 **生產機的 venv 原本沒有它**(部署時實際撞到
+`ModuleNotFoundError: No module named 'orjson'`,producer 崩在 import、systemd 重啟 4 次
+才被 StartLimit 擋住 —— 好在崩在登入之前,零 Shioaji 連線、無 451 風險)。
+
+```bash
+sudo -u shioaji_svc bash -lc 'cd ~/txf-streaming-server && uv pip install --python .venv/bin/python orjson==3.11.9'
+```
+
+**教訓**:`requirements.lock` 裡有某個套件 **不等於** 目標機器裝了它 ——
+lock 是在 Windows dev 端解析出來的,orjson 在那邊是 `pysolace` 的間接相依,
+Linux 端的解析結果不同。**間接相依永遠不可當成「一定在」**,要嘛明列、要嘛實際驗證。
+
+⚠️ **不要用 `uv pip sync requirements.lock` 修這種問題** —— `sync` 會**移除**不在 lock 裡的套件,
+爆炸半徑遠大於裝單一套件。
 
 ### uv 的 PATH 陷阱(runbook 實戰補充)
 
