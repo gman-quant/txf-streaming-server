@@ -8,6 +8,11 @@
 confluent-kafka>=2.14.2
 dotenv
 grpcio-tools>=1.82.1
+# orjson:raw topic 的 JSON 序列化(2026-07-26)。選它不是為了速度(353 則/秒下無感),
+# 而是 ① 回傳 bytes,Kafka 直接吃 ② **原生把 datetime 序列化成 RFC 3339 含微秒**。
+# 它本來就已經在 lock 裡(pysolace → orjson 的間接相依,故生產機已安裝、無需 install),
+# 這裡明列是為了「哪天 shioaji 換掉 pysolace,它不會靜默消失」。
+orjson>=3.10
 protobuf>=7.35.1
 # pyarrow 是 shioaji 的相依,明列以與其他 repo 版本一致
 pyarrow>=25.0.0
