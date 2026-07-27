@@ -128,6 +128,8 @@ class TxfStreamingService:
         # next() 對 itertools.count 是 C 層操作,GIL 下原子,不需要鎖。
         self._raw_seq = itertools.count()
         self._raw_err = 0
+        # 已做過欄位稽核的 (type, role);每種只在啟動後的第一則印一次(見 _field_audit)
+        self._audited = set()
 
     def _init_kafka(self):
         """初始化 Kafka Producer"""
@@ -194,6 +196,69 @@ class TxfStreamingService:
             return False
         return code in (r2.code, getattr(r2, "target_code", ""))
 
+    def _field_audit(self, kind: str, role: str, quote) -> None:
+        """一次性欄位稽核:比對三種取值法,找出**我們正在漏掉的欄位**。
+
+        為什麼需要 —— `to_dict()` 已證實不完整(2026-07-27 實查):
+          · `BidAskFOPv1.to_dict()` 少了 `exchange`(型別宣告有,to_dict 不吐)
+          · `QuoteFOPv1` 有 **46** 個屬性,`to_dict()` 只給 **34** 個
+            (少了 target_kind_price / vol_sum / amount_sum / trade_bid_cnt /
+             trade_ask_cnt / trade_*_vol_sum / diff_price / diff_rate / diff_type /
+             first_derived_*_volume)
+          · 三個型別都有 `to_dict(raw=False)` 簽章,`raw=True` 從沒試過
+        而擷取層漏掉的東西是**永久的**(bidask/quote 沒有歷史 API,補不回來)。
+
+        每個 (kind, role) 只跑一次。整段吞例外 —— **稽核絕不能影響擷取**。
+        """
+        key = (kind, role)
+        if key in self._audited:
+            return
+        self._audited.add(key)          # 先設旗標:就算下面炸了也不要每則重試
+        try:
+            k_dict = set(quote.to_dict())
+
+            k_raw, raw_err = None, ""
+            try:
+                k_raw = set(quote.to_dict(raw=True))
+            except Exception as e:
+                raw_err = repr(e)
+
+            # dir() + getattr:**逐個**包 try —— PyO3 的 property 可能拋錯
+            attrs, attr_err = {}, {}
+            for name in dir(quote):
+                if name.startswith("_"):
+                    continue
+                try:
+                    v = getattr(quote, name)
+                except Exception as e:
+                    attr_err[name] = repr(e)[:120]
+                    continue
+                if callable(v):
+                    continue
+                attrs[name] = v
+            k_attr = set(attrs)
+
+            out = [f"🔍 FIELD-AUDIT {kind}/{role} code={getattr(quote, 'code', '?')}",
+                   f"   to_dict()      {len(k_dict):>3} keys",
+                   f"   to_dict(raw)   " + (f"{len(k_raw):>3} keys" if k_raw is not None
+                                            else f"取不到 → {raw_err}"),
+                   f"   dir()+getattr  {len(k_attr):>3} keys"
+                   + (f"   ⚠ 取值失敗 {len(attr_err)}: {attr_err}" if attr_err else "")]
+
+            missing = sorted(k_attr - k_dict)
+            out.append(f"   ▶ dir − to_dict = {len(missing)} 個【我們正在漏的】")
+            for n in missing:
+                out.append(f"       {n} = {repr(attrs[n])[:200]}")
+            if k_raw is not None:
+                out.append(f"   ▶ raw − to_dict = {sorted(k_raw - k_dict)}")
+                out.append(f"   ▶ to_dict − raw = {sorted(k_dict - k_raw)}")
+            extra = sorted(k_dict - k_attr)
+            out.append(f"   ▶ to_dict − dir = {extra}"
+                       + ("   ⚠ 非空 = dir() 拿不到某些 to_dict 有的東西" if extra else ""))
+            logger.info("\n".join(out))
+        except Exception as e:
+            logger.error(f"❌ FIELD-AUDIT {kind}/{role} 失敗(不影響擷取): {e}")
+
     def _emit_raw(self, kind: str, quote, role: str) -> None:
         """把 Shioaji 原始行情物件**完整**送進 raw topic(JSON)。
 
@@ -209,6 +274,8 @@ class TxfStreamingService:
 
         附加欄位一律 `_` 前綴,避免與 Shioaji 欄位名相撞。
         """
+        # 一次性稽核(自帶 try/except,印完設旗標就不再進來)
+        self._field_audit(kind, role, quote)
         try:
             payload = quote.to_dict()
             payload["_type"] = kind          # tick / bidask / quote
@@ -243,6 +310,17 @@ class TxfStreamingService:
 
     def process_tick(self, quote: TickFOPv1):
         """處理 Tick 並推送到 Kafka"""
+        # 2026-07-27:tick 也進 raw topic。兩個位置上的講究:
+        #  ⚠ 必須在 `simtrade` 過濾**之前** —— raw 要保留試撮(日盤 08:30–08:45、
+        #    夜盤 14:50–15:00,歷史 API 一則都沒有);proto 路徑照舊過濾。
+        #  ⚠ 必須在原有 try **之外** —— _emit_raw 自帶 try/except 且絕不 re-raise,
+        #    放外面才不會跟既有的錯誤處理糾纏。
+        # 為什麼要做:Quote 是 book 節奏,**19% 的成交會被併進同一次書更新**
+        #    (實測 11,625 次變化 vs 11,409 筆成交,最多一次併 36 筆)。
+        #    tick 不進 raw,逐筆粒度與「成交 vs 書更新的相對順序」就永遠補不回來 ——
+        #    交易所的 PROD-MSG-SEQ 拿不到,同一個 partition 的順序是唯一的替代品。
+        self._emit_raw("tick", quote, "R2" if self._is_r2(quote.code) else "R1")
+
         try:
             if quote.simtrade == 1: return
 
