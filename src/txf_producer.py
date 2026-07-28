@@ -303,8 +303,10 @@ class TxfStreamingService:
         QuoteFOPv1 在資訊上是 TickFOPv1 ∪ BidAskFOPv1 的超集:
         含 first_derived_* ×4、bid/ask_side_total_cnt(另兩者都沒有),
         缺的 bid_total_vol/ask_total_vol 實測 100% 等於五檔加總(544,067 列)= 純冗餘。
-        尚未確認的是**觸發節奏**(委託簿變動就發 ≈544k/日,或成交才發 ≈87k/日)——
-        錄一天資料就能判定。
+        觸發節奏已實測判定(2026-07-27/28):**book 節奏**,與 BidAsk 事件 1:1、
+        逐則同簿 100.00%;成交以 total_volume 前進(running-max)辨識。
+        7/28 崩盤夜另證:原生 Tick 流掉單 144 處/188 口(0.35%),Quote 的累計量
+        與 tick 流自身累計欄一致 = 權威 —— 未來若以 Quote 萃取取代 tick 流,依據在此。
         """
         self._emit_raw("quote", quote, "R2" if self._is_r2(quote.code) else "R1")
 
@@ -528,12 +530,14 @@ class TxfStreamingService:
 
             self.api.subscribe(self.contract_r2, quote_type=sj.QuoteType.Quote)
             self.api.subscribe(self.contract_r2, quote_type=sj.QuoteType.Tick)
-            # R2 BidAsk(2026-07-26 新增):次月委託簿 + 衍生一檔的唯一來源。
-            # 只進 raw topic —— 路由在 process_bidask 的開頭。
-            self.api.subscribe(self.contract_r2, quote_type=sj.QuoteType.BidAsk)
-            logger.info(f"✅ Subscribed R2 (Quote + Tick + BidAsk): {r2_desc}")
+            # R2 BidAsk:2026-07-26 訂、2026-07-28 退訂。實測(7/27 日盤 + 7/28 崩盤夜):
+            # Quote 對 BidAsk 事件 1:1(117,896:117,895 / 203,516:203,514)、逐則同簿
+            # 100.00%、簿況鏈式一致 → R2 BidAsk 純冗餘。它唯一下游是 raw topic,
+            # 衍生一檔在 Quote 的 first_derived_* 完整保留。process_bidask 的 R2 分流
+            # 守衛**保留不動**(誤訂/復訂時仍擋 R2 污染 txf-bidask)。
+            logger.info(f"✅ Subscribed R2 (Quote + Tick): {r2_desc}")
 
-        logger.info(f"📡 Raw topic: {MD_RAW_TOPIC} (quote×2 + R2 bidask, 完整 JSON)")
+        logger.info(f"📡 Raw topic: {MD_RAW_TOPIC} (quote×2 + tick×2, 完整 JSON)")
         self.running = True
 
     def shutdown(self):
