@@ -14,17 +14,23 @@ Live 行情 producer:Shioaji → Protobuf(看盤線)+ JSON(研究線)→ Kafka�
 ## 事實
 
 - 執行必須是模組形式:`python -m src.txf_producer`(相對 import;直接跑檔案會 ImportError)。venv Python 3.13(uv 管理,`.python-version` 鎖定)。
-- Topic 路由(**2026-07-26 改版**):
+- Topic 路由(**2026-07-28 V-FLIP 改版**;訂閱端態 = **Quote×2 + BidAsk R1 三訂閱**):
   | 來源 | topic | 格式 | 消費者 |
   |---|---|---|---|
-  | R1 tick | `txf-tick` | protobuf | platform/stable viewer、gale |
-  | R2 tick | `txfr2-tick` | protobuf | platform/stable viewer |
-  | **R1** BidAsk | `txf-bidask` | protobuf | gale(匯出 `{date}_TXF_bidask.parquet`) |
-  | **R2 BidAsk + R1/R2 Quote** | **`txf-md-raw`** | **JSON(orjson)** | 待寫的匯出器 |
+  | R1 tick(**由 Quote 合成**,`_synth_tick`) | `txf-tick` | protobuf | platform/stable viewer、gale |
+  | R2 tick(**由 Quote 合成**) | `txfr2-tick` | protobuf | platform/stable viewer |
+  | **R1** BidAsk(原生訂閱,保留) | `txf-bidask` | protobuf | gale(匯出 `{date}_TXF_bidask.parquet`) |
+  | **R1/R2 Quote** | **`txf-md-raw`** | **JSON(orjson)** | gale `tools/export_md_raw.py`(手動,待掛排程) |
 
-  ⚠️ **R2 的 BidAsk 絕對不可進 `txf-bidask`** —— gale 匯出時不依 code 過濾,混進去會污染 R1 的檔。分流在 `process_bidask()` 開頭 early-return。
+  **V-FLIP(2026-07-28)**:Tick×2 與 BidAsk R2 退訂。tick 改由 Quote 以 `synth_tick_dv`
+  (running-max of total_volume)合成 —— 依據:原生 Tick 實測掉單(崩盤夜 144 處/188 口),
+  合成總量 == 權威累計量;同成交延遲 med −1.6ms;代價 = 掃檔為事件級,5s K 棒 H/L
+  崩盤爆量段可差 ≤13 點/58 根(無仲裁者)。驗收:`src/tools/verify_tick_synth.py`
+  (離線重放 md-raw,用生產同一顆函數)。**回退 = git revert 整個 V-FLIP commit;
+  勿只加回訂閱(原生+合成雙寫 txf-tick = 訊息重複)。**
+  ⚠️ **R2 的 BidAsk 絕對不可進 `txf-bidask`** —— gale 匯出時不依 code 過濾,混進去會污染 R1 的檔。分流在 `process_bidask()` 開頭 early-return(R2 BidAsk 已退訂,守衛保留防復訂污染)。
   ⚠️ R2 的 quote.code 是真實合約碼(如 TXFI6)非 "TXFR2",判定要同時比對 target_code(commit 6441f48 修的 bug,別退回)—— 已抽成 `_is_r2()`。
-  ⚠️ **訂閱順序刻意讓 Quote 排在 Tick/BidAsk 之前**:同一合約同時訂三種型別,Shioaji **無文件**說明後訂的會不會覆蓋前面的。Quote 放最前面,最壞情況只是拿不到 Quote(研究線缺料);放最後則可能踢掉 Tick → viewer 沒行情。**別調換順序。**
+  ⚠️ 訂閱順序 Quote 在前(慣例保留)。「共訂會不會互踢」已於 7/27–7/28 實測**不互踢**(六訂閱期間 txf-tick 與 md-raw tick 流逐則同數);V-FLIP 後僅剩兩型別,此顧慮不再適用。
 - simtrade==1(試撮)**只在 protobuf 路徑被過濾**;`txf-md-raw` **刻意保留試撮**(欄位在,要濾隨時能濾)。試撮是歷史 API 完全沒有的資料:日盤 08:30–08:45、夜盤 14:50–15:00,每 5 秒一則(量體極小,約 180 則/商品/盤)。
 - `txf-md-raw` 的設計原則:**`to_dict()` 全欄位、不挑、不改精度**。代價已經付過 —— protobuf 的 BidAsk 漏了 `first_derived_*`(衍生一檔=組合簿的唯一入口)整整八個月,而 bidask 無歷史 API、補不回來。用 **orjson** 是因為它回傳 bytes 且**原生保留 datetime 微秒**(protobuf 路徑的 `int(ts*1000)` 把微秒截掉了;交易所 `INFORMATION-TIME` 其實給到微秒)。附加欄位 `_type` / `_role`(R1/R2,因為 code 會隨換月變)/ `_recv_ns` / `_seq`。
   ⚠️ `raw_json_default` **刻意嚴格**(只認 `.value` 枚舉與 Decimal,其餘 raise)—— 別改成 `default=str`,那會讓 Shioaji 改型別時靜默產生怪資料。

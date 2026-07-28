@@ -102,6 +102,24 @@ def raw_json_default(o):
 # 2. Core Service Class
 # ==========================================
 
+def synth_tick_dv(tv_max: dict, code: str, total_volume: int, volume: int):
+    """tick 合成的核心規則(純函數;`_synth_tick` 與 `tools/verify_tick_synth.py` 共用)。
+
+    dv = total_volume − running_max。>0 = 這則 Quote 承載了成交,回傳應發的口數;
+    None = 純簿況 / 陳舊快照(<0)/ 冷啟動基準設定。
+    冷啟動:首則若 total_volume == volume > 0(= 開盤集合競價,session 全量即本筆)
+    → 照發;否則(盤中重啟)只設基準不發 —— 避免把重啟前的整段累計誤發成一筆巨量 tick。
+    """
+    base = tv_max.get(code)
+    if base is None:
+        tv_max[code] = total_volume
+        return volume if (total_volume == volume and volume > 0) else None
+    if total_volume <= base:
+        return None
+    tv_max[code] = total_volume
+    return total_volume - base
+
+
 class TxfStreamingService:
     """
     台指期行情串流服務
@@ -130,6 +148,9 @@ class TxfStreamingService:
         self._raw_err = 0
         # 已做過欄位稽核的 (type, role);每種只在啟動後的第一則印一次(見 _field_audit)
         self._audited = set()
+        # V-FLIP(2026-07-28):tick 合成的 per-code 累計量基準(running-max)。
+        # 每個 producer 行程只跨一個 session(crontab 08:28/14:48 啟停)→ 基準天然歸零。
+        self._synth_tv_max: dict = {}
 
     def _init_kafka(self):
         """初始化 Kafka Producer"""
@@ -306,12 +327,61 @@ class TxfStreamingService:
         觸發節奏已實測判定(2026-07-27/28):**book 節奏**,與 BidAsk 事件 1:1、
         逐則同簿 100.00%;成交以 total_volume 前進(running-max)辨識。
         7/28 崩盤夜另證:原生 Tick 流掉單 144 處/188 口(0.35%),Quote 的累計量
-        與 tick 流自身累計欄一致 = 權威 —— 未來若以 Quote 萃取取代 tick 流,依據在此。
+        與 tick 流自身累計欄一致 = 權威 —— 2026-07-28 起 tick 流即由此合成(_synth_tick)。
         """
         self._emit_raw("quote", quote, "R2" if self._is_r2(quote.code) else "R1")
+        self._synth_tick(quote)
+
+    def _synth_tick(self, quote: QuoteFOPv1) -> None:
+        """V-FLIP(2026-07-28):Quote → 合成 Tick(protobuf)→ txf-tick / txfr2-tick。
+        取代原生 Tick 訂閱,成為 viewer 看盤線的水源。
+
+        依據(7/27–7/28 實測,詳 workspace 驗證紀錄):
+          - 原生 Tick 流會掉單(崩盤夜 144 處/188 口 = 0.35%);Quote 的 total_volume
+            與 tick 流自身累計欄完全一致 = 權威 → 合成流的**總量比原生更準**。
+          - 同成交延遲 med −1.6ms(Quote 略早),路徑同級。
+          - 已知代價:掃檔(一單掃多檔)在 Quote 是單一事件 → 合成 tick 為「事件級」:
+            volume = 累計量增量(dv)、close = 該群最後成交價,群內中間價位不可還原
+            (5s K 棒 H/L 崩盤爆量段實測差 ≤13 點/58 根;原生同樣有損,無仲裁者)。
+        規則:simtrade 跳過(proto 路徑歷來不進試撮);dv 判準見 synth_tick_dv。
+        欄位集合與 process_tick 完全一致(七欄),差異僅 volume=dv 而非群內最後一筆。
+        """
+        try:
+            if quote.simtrade == 1:
+                return
+            dv = synth_tick_dv(self._synth_tv_max, quote.code,
+                               int(quote.total_volume), int(quote.volume))
+            if dv is None:
+                return
+
+            tick = txf_data_pb2.Tick()
+            tick.code = quote.code
+            tick.timestamp_ms = int(quote.datetime.timestamp() * 1000)
+            tick.tick_type = int(quote.tick_type)   # 群組最後一筆的內外盤(下游 viewer 不用此欄)
+            tick.close = self._to_scaled_int(quote.close)
+            tick.volume = int(dv)                   # ⚠ 事件級增量(權威累計量差),非 quote.volume
+            tick.underlying_price = self._to_scaled_int(quote.underlying_price)
+            tick.total_volume = int(quote.total_volume)
+
+            target_topic = TICK_TOPIC
+            if self.contract_r2 and quote.code in (self.contract_r2.code,
+                                                   getattr(self.contract_r2, "target_code", "")):
+                target_topic = TICK_R2_TOPIC
+            self.producer.produce(
+                target_topic,
+                key=tick.code.encode('utf-8'),
+                value=tick.SerializeToString(),
+                on_delivery=self._delivery_report
+            )
+        except Exception as e:
+            logger.error(f"❌ 合成 tick 失敗: {e}")
 
     def process_tick(self, quote: TickFOPv1):
-        """處理 Tick 並推送到 Kafka"""
+        """處理 Tick 並推送到 Kafka。
+
+        ⚠ V-FLIP(2026-07-28)後 Tick 已退訂,本回調**休眠**(不會被呼叫)。
+        保留原因:回退路徑 = git revert 整個 V-FLIP commit 後本函數原樣復活。
+        """
         # 2026-07-27:tick 也進 raw topic。兩個位置上的講究:
         #  ⚠ 必須在 `simtrade` 過濾**之前** —— raw 要保留試撮(日盤 08:30–08:45、
         #    夜盤 14:50–15:00,歷史 API 一則都沒有);proto 路徑照舊過濾。
@@ -512,16 +582,16 @@ class TxfStreamingService:
         if hasattr(self.contract_r1, 'delivery_month'):
             r1_desc += f" [Delivery: {self.contract_r1.delivery_month}]"
             
-        # ⚠ 訂閱順序刻意讓 **Quote 排在 Tick/BidAsk 之前**。
-        #   原因:同一合約同時訂 Tick + BidAsk + Quote,Shioaji **沒有任何文件**說明
-        #   後訂的會不會覆蓋前面的。若真的會覆蓋,「Quote 最後訂」的下場是
-        #   Tick 被踢掉 → txf-tick 斷 → viewer 直接沒行情(真錢工具)。
-        #   反過來把 Quote 放最前面,最壞情況只是拿不到 Quote(研究線少一份資料,無害)。
-        #   ⇒ 失敗模式從「看盤瞎掉」降級為「研究資料缺一項」。實測後可再調整。
+        # 訂閱順序:Quote 在前(7/27–7/28 已實測「共訂不互踢」,順序保留為慣例)。
+        # V-FLIP(2026-07-28):**Tick×2 退訂** —— txf-tick/txfr2-tick 改由 _synth_tick
+        # 從 Quote 合成(總量比原生準:原生 Tick 崩盤夜實測掉單 144 處/188 口;
+        # 延遲同級 med −1.6ms)。BidAsk R1 保留:txf-bidask 的原生水源(gale 匯出線),
+        # 合成簿況與原生在成交時刻 ~34% 不同拍,不取代。
+        # ⚠ 回退 = git revert 整個 commit —— **勿只加回 Tick 訂閱**,那會讓
+        #   原生與合成雙寫 txf-tick(訊息重複、量翻倍)。
         self.api.subscribe(self.contract_r1, quote_type=sj.QuoteType.Quote)
-        self.api.subscribe(self.contract_r1, quote_type=sj.QuoteType.Tick)
         self.api.subscribe(self.contract_r1, quote_type=sj.QuoteType.BidAsk)
-        logger.info(f"✅ Subscribed R1 (Quote + Tick + BidAsk): {r1_desc}")
+        logger.info(f"✅ Subscribed R1 (Quote + BidAsk): {r1_desc}")
 
         if self.contract_r2:
             r2_desc = f"{self.contract_r2.name} ({self.contract_r2.code})"
@@ -529,15 +599,15 @@ class TxfStreamingService:
                 r2_desc += f" [Delivery: {self.contract_r2.delivery_month}]"
 
             self.api.subscribe(self.contract_r2, quote_type=sj.QuoteType.Quote)
-            self.api.subscribe(self.contract_r2, quote_type=sj.QuoteType.Tick)
+            # R2 Tick:2026-07-28 隨 V-FLIP 退訂(txfr2-tick 由 _synth_tick 合成)。
             # R2 BidAsk:2026-07-26 訂、2026-07-28 退訂。實測(7/27 日盤 + 7/28 崩盤夜):
             # Quote 對 BidAsk 事件 1:1(117,896:117,895 / 203,516:203,514)、逐則同簿
             # 100.00%、簿況鏈式一致 → R2 BidAsk 純冗餘。它唯一下游是 raw topic,
             # 衍生一檔在 Quote 的 first_derived_* 完整保留。process_bidask 的 R2 分流
             # 守衛**保留不動**(誤訂/復訂時仍擋 R2 污染 txf-bidask)。
-            logger.info(f"✅ Subscribed R2 (Quote + Tick): {r2_desc}")
+            logger.info(f"✅ Subscribed R2 (Quote): {r2_desc}")
 
-        logger.info(f"📡 Raw topic: {MD_RAW_TOPIC} (quote×2 + tick×2, 完整 JSON)")
+        logger.info(f"📡 Raw topic: {MD_RAW_TOPIC} (quote×2, 完整 JSON)")
         self.running = True
 
     def shutdown(self):
