@@ -14,20 +14,24 @@ Live 行情 producer:Shioaji → Protobuf(看盤線)+ JSON(研究線)→ Kafka�
 ## 事實
 
 - 執行必須是模組形式:`python -m src.txf_producer`(相對 import;直接跑檔案會 ImportError)。venv Python 3.13(uv 管理,`.python-version` 鎖定)。
-- Topic 路由(**2026-07-28 V-FLIP 改版**;訂閱端態 = **Quote×2 + BidAsk R1 三訂閱**):
+- Topic 路由(**2026-07-28 V-FLIP/V-FLIP2 改版**;訂閱端態 = **Quote×2 兩訂閱**):
   | 來源 | topic | 格式 | 消費者 |
   |---|---|---|---|
   | R1 tick(**由 Quote 合成**,`_synth_tick`) | `txf-tick` | protobuf | platform/stable viewer、gale |
   | R2 tick(**由 Quote 合成**) | `txfr2-tick` | protobuf | platform/stable viewer |
-  | **R1** BidAsk(原生訂閱,保留) | `txf-bidask` | protobuf | gale(匯出 `{date}_TXF_bidask.parquet`) |
+  | R1 BidAsk(**由 Quote 合成**,`_synth_bidask`) | `txf-bidask` | protobuf | gale(匯出 `{date}_TXF_bidask.parquet`) |
   | **R1/R2 Quote** | **`txf-md-raw`** | **JSON(orjson)** | gale `tools/export_md_raw.py`(手動,待掛排程) |
 
   **V-FLIP(2026-07-28)**:Tick×2 與 BidAsk R2 退訂。tick 改由 Quote 以 `synth_tick_dv`
   (running-max of total_volume)合成 —— 依據:原生 Tick 實測掉單(崩盤夜 144 處/188 口),
   合成總量 == 權威累計量;同成交延遲 med −1.6ms;代價 = 掃檔為事件級,5s K 棒 H/L
   崩盤爆量段可差 ≤13 點/58 根(無仲裁者)。驗收:`src/tools/verify_tick_synth.py`
-  (離線重放 md-raw,用生產同一顆函數)。**回退 = git revert 整個 V-FLIP commit;
-  勿只加回訂閱(原生+合成雙寫 txf-tick = 訊息重複)。**
+  (離線重放 md-raw,用生產同一顆函數)。
+  **V-FLIP2(同日)**:BidAsk R1 也退訂,txf-bidask 由 `_synth_bidask` 合成 —— 依據:
+  R1 逐則同簿 **100.00% 雙向**(178,219/178,219,含 diff 欄;archive vs quote 全欄 join)、
+  totals==Σ五檔零違例。成交時刻「~34% 不同拍」經查為**配對抖動**(同一批簿況狀態、
+  到達序不同),內容序列 100% 同 —— 不構成保留原生的理由。
+  **回退 = git revert 整個 V-FLIP/V-FLIP2 commit;勿只加回訂閱(原生+合成雙寫 = 訊息重複)。**
   ⚠️ **R2 的 BidAsk 絕對不可進 `txf-bidask`** —— gale 匯出時不依 code 過濾,混進去會污染 R1 的檔。分流在 `process_bidask()` 開頭 early-return(R2 BidAsk 已退訂,守衛保留防復訂污染)。
   ⚠️ R2 的 quote.code 是真實合約碼(如 TXFI6)非 "TXFR2",判定要同時比對 target_code(commit 6441f48 修的 bug,別退回)—— 已抽成 `_is_r2()`。
   ⚠️ 訂閱順序 Quote 在前(慣例保留)。「共訂會不會互踢」已於 7/27–7/28 實測**不互踢**(六訂閱期間 txf-tick 與 md-raw tick 流逐則同數);V-FLIP 後僅剩兩型別,此顧慮不再適用。

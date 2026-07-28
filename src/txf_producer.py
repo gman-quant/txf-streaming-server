@@ -331,6 +331,7 @@ class TxfStreamingService:
         """
         self._emit_raw("quote", quote, "R2" if self._is_r2(quote.code) else "R1")
         self._synth_tick(quote)
+        self._synth_bidask(quote)
 
     def _synth_tick(self, quote: QuoteFOPv1) -> None:
         """V-FLIP(2026-07-28):Quote → 合成 Tick(protobuf)→ txf-tick / txfr2-tick。
@@ -375,6 +376,42 @@ class TxfStreamingService:
             )
         except Exception as e:
             logger.error(f"❌ 合成 tick 失敗: {e}")
+
+    def _synth_bidask(self, quote: QuoteFOPv1) -> None:
+        """V-FLIP2(2026-07-28):Quote → 合成 BidAsk(protobuf)→ txf-bidask(R1 專屬)。
+        取代原生 BidAsk R1 訂閱 → 端態兩訂閱(Quote×2)。
+
+        依據(7/27 日盤,lake archive vs md-raw quote 全欄 join):
+          R1 逐則同簿 **100.00% 雙向**(178,219/178,219,含 diff_bid/ask_vol);
+          bid/ask_total_vol == Σ五檔 **零違例**(178,219×2)→ 合成無損。
+        R2 不發(txf-bidask 是 R1 專屬;gale 匯出不依 code 過濾 —— 原守衛精神)。
+        simtrade 跳過(native 路徑歷來如此)。欄位十枚與 process_bidask 完全一致,
+        僅 totals 由 Σ五檔合成(實測恆等)。
+        """
+        try:
+            if quote.simtrade == 1:
+                return
+            if self._is_r2(quote.code):
+                return
+            ba = txf_data_pb2.BidAsk()
+            ba.code = quote.code
+            ba.timestamp_ms = int(quote.datetime.timestamp() * 1000)
+            ba.bid_total_vol = int(sum(quote.bid_volume))
+            ba.ask_total_vol = int(sum(quote.ask_volume))
+            ba.bid_price.extend([self._to_scaled_int(x) for x in quote.bid_price])
+            ba.ask_price.extend([self._to_scaled_int(x) for x in quote.ask_price])
+            ba.bid_volume.extend(quote.bid_volume)
+            ba.ask_volume.extend(quote.ask_volume)
+            ba.diff_bid_vol.extend(quote.diff_bid_vol)
+            ba.diff_ask_vol.extend(quote.diff_ask_vol)
+            self.producer.produce(
+                BIDASK_TOPIC,
+                key=ba.code.encode('utf-8'),
+                value=ba.SerializeToString(),
+                on_delivery=self._delivery_report
+            )
+        except Exception as e:
+            logger.error(f"❌ 合成 bidask 失敗: {e}")
 
     def process_tick(self, quote: TickFOPv1):
         """處理 Tick 並推送到 Kafka。
@@ -423,7 +460,11 @@ class TxfStreamingService:
             logger.error(f"❌ Tick Process Error: {e}")
 
     def process_bidask(self, quote: BidAskFOPv1):
-        """處理 BidAsk 並推送到 Kafka"""
+        """處理 BidAsk 並推送到 Kafka。
+
+        ⚠ V-FLIP2(2026-07-28)後 BidAsk 已全退訂,本回調**休眠**(不會被呼叫)。
+        保留原因:回退路徑 = git revert 整個 V-FLIP2 commit 後原樣復活。
+        """
         # 2026-07-26:新增 R2 BidAsk 訂閱後,R2 的訊息也會走進這個回調。
         # ⚠⚠ R2 **絕對不可以**進 BIDASK_TOPIC(txf-bidask)——
         #     那個 topic 是 gale-engine 匯出 `{date}_TXF_bidask.parquet` 的來源,
@@ -585,13 +626,14 @@ class TxfStreamingService:
         # 訂閱順序:Quote 在前(7/27–7/28 已實測「共訂不互踢」,順序保留為慣例)。
         # V-FLIP(2026-07-28):**Tick×2 退訂** —— txf-tick/txfr2-tick 改由 _synth_tick
         # 從 Quote 合成(總量比原生準:原生 Tick 崩盤夜實測掉單 144 處/188 口;
-        # 延遲同級 med −1.6ms)。BidAsk R1 保留:txf-bidask 的原生水源(gale 匯出線),
-        # 合成簿況與原生在成交時刻 ~34% 不同拍,不取代。
+        # 延遲同級 med −1.6ms)。V-FLIP2 同日:BidAsk R1 也退訂,txf-bidask 由
+        # _synth_bidask 合成(R1 逐則同簿 100.00% 雙向、含 diff 欄,無損)。
         # ⚠ 回退 = git revert 整個 commit —— **勿只加回 Tick 訂閱**,那會讓
         #   原生與合成雙寫 txf-tick(訊息重複、量翻倍)。
         self.api.subscribe(self.contract_r1, quote_type=sj.QuoteType.Quote)
-        self.api.subscribe(self.contract_r1, quote_type=sj.QuoteType.BidAsk)
-        logger.info(f"✅ Subscribed R1 (Quote + BidAsk): {r1_desc}")
+        # BidAsk R1:2026-07-28 隨 V-FLIP2 退訂 —— txf-bidask 改由 _synth_bidask 合成
+        # (R1 逐則同簿 100.00% 雙向、totals==Σ五檔零違例,無損)。端態 = Quote×2 兩訂閱。
+        logger.info(f"✅ Subscribed R1 (Quote): {r1_desc}")
 
         if self.contract_r2:
             r2_desc = f"{self.contract_r2.name} ({self.contract_r2.code})"
