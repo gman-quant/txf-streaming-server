@@ -36,6 +36,16 @@ Live 行情 producer:Shioaji → Protobuf(看盤線)+ JSON(研究線)→ Kafka�
   ⚠️ R2 的 quote.code 是真實合約碼(如 TXFI6)非 "TXFR2",判定要同時比對 target_code(commit 6441f48 修的 bug,別退回)—— 已抽成 `_is_r2()`。
   ⚠️ 訂閱順序 Quote 在前(慣例保留)。「共訂會不會互踢」已於 7/27–7/28 實測**不互踢**(六訂閱期間 txf-tick 與 md-raw tick 流逐則同數);V-FLIP 後僅剩兩型別,此顧慮不再適用。
 - simtrade==1(試撮)**只在 protobuf 路徑被過濾**;`txf-md-raw` **刻意保留試撮**(欄位在,要濾隨時能濾)。試撮是歷史 API 完全沒有的資料:日盤 08:30–08:45、夜盤 14:50–15:00,每 5 秒一則(量體極小,約 180 則/商品/盤)。
+- **⚠ `to_dict()` 本身就不完整(2026-07-28 生產實證)**:`QuoteFOPv1` 有 46 個屬性,
+  `to_dict()` 只吐 **34** 個 —— SDK 的 schema 沒宣告那 12 個
+  (`amount_sum` / `diff_price` / `diff_rate` / `diff_type` / **`first_derived_{bid,ask}_volume`** /
+  `target_kind_price` / `trade_{bid,ask}_cnt` / `trade_{bid,ask}_vol_sum` / `vol_sum`),
+  **所以任何走 to_dict 的序列化天生就漏**。V-FLIP2 退訂 BidAsk 後,`first_derived_*`
+  (衍生一檔=組合簿唯一入口)一度沒有任何來源在收 —— 已由 `_extra_field_names` 以 `getattr`
+  補進 raw payload(名單每 (kind, role) 只算一次,之後每則 12 次 getattr;**全程不印 log**)。
+  名單用 `dir()` 動態算而非寫死 —— SDK 日後新增欄位自動收進來,不必有人記得改碼。
+  2026-07-27 的一次性 `FIELD-AUDIT` 傾印(每次啟動 16 行)**已移除**:診斷任務完成即除役
+  (使用者指示,2026-07-28)。離線驗證:scratchpad `test_extra_fields.py`(假 Quote,不登入不連 Kafka)。
 - `txf-md-raw` 的設計原則:**`to_dict()` 全欄位、不挑、不改精度**。代價已經付過 —— protobuf 的 BidAsk 漏了 `first_derived_*`(衍生一檔=組合簿的唯一入口)整整八個月,而 bidask 無歷史 API、補不回來。用 **orjson** 是因為它回傳 bytes 且**原生保留 datetime 微秒**(protobuf 路徑的 `int(ts*1000)` 把微秒截掉了;交易所 `INFORMATION-TIME` 其實給到微秒)。附加欄位 `_type` / `_role`(R1/R2,因為 code 會隨換月變)/ `_recv_ns` / `_seq`。
   ⚠️ `raw_json_default` **刻意嚴格**(只認 `.value` 枚舉與 Decimal,其餘 raise)—— 別改成 `default=str`,那會讓 Shioaji 改型別時靜默產生怪資料。
   ⚠️ `_emit_raw` **絕不 re-raise**:例外冒回 Shioaji 回調執行緒可能讓該回調永久靜默停止。錯誤只計數 + 每 500 次節流 log。
