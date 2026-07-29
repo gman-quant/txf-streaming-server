@@ -223,9 +223,16 @@ class TxfStreamingService:
 
         為什麼需要 —— **`to_dict()` 不等於物件全欄位**:`QuoteFOPv1` 有 46 個屬性,
         `to_dict()` 只吐 34 個(SDK 的 schema 沒宣告其餘 12 個),所以「to_dict 全收」
-        這個原則本身就有洞。其中 `first_derived_*_volume` = 衍生一檔(組合簿的唯一入口),
-        V-FLIP2 退訂 BidAsk 之後沒有別的來源在收 —— 而擷取層漏掉的東西是**永久的**
-        (quote/bidask 沒有歷史 API,補不回來)。
+        這個原則本身就有洞。擷取層漏掉的東西是**永久的**(quote/bidask 無歷史 API)。
+
+        ⚠️ **更正(2026-07-29 實測)**:原註解稱「`first_derived_*_volume` 是衍生一檔的
+        唯一入口、V-FLIP2 後沒別的來源在收」—— **不成立**。`to_dict()` 早就有
+        `first_derived_bid_vol` / `first_derived_ask_vol`(以及對應的 `_price`),
+        與這裡補的 `_volume` 版**逐列完全相同**(2026-07-29 對 5 萬列比對,零筆不同)
+        ⇒ 這 12 欄裡有 **2 欄是既有欄位的別名**,衍生一檔從來沒有斷過來源。
+        **仍保留補收**(而非剔除)的理由:剔除會讓 producer 與 gale exporter 的
+        `EXPECTED` 名單必須同步部署,不同步時 exporter 會判「缺欄位」而 **sys.exit(1)**;
+        別名重複的成本是每則 2 個小整數,遠低於那個風險。消費端請認 `_vol` 版為主。
 
         用 dir() 動態算而非寫死名單:Shioaji 日後新增欄位會自動被收進來,不必有人記得改碼。
         逐個 getattr 包 try —— PyO3 的 property 可能拋錯。**全程不印 log**。
