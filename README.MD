@@ -17,11 +17,15 @@
 |---|---|
 | **執行** | `python -m src.txf_producer`(必須是模組形式) |
 | **需求** | Python 3.13(`.python-version` 鎖定)、shioaji ≥ 1.7、一個 Kafka broker |
-| **部署** | Ubuntu + systemd + crontab,見 [第 3 節](#3-部署) |
+| **部署** | Ubuntu + systemd + crontab,見 [第 3 節](#3-部署)。**現行生產機 = `192.168.1.50`,Kafka broker 同機** |
 
 ---
 
 ## 1. 要部署一整套?照這個順序
+
+> 🧭 **正典在 [workspace 根的 README](../README.md)** —— 機器拓撲、埠一覽、三支排程、
+> 每日 sync 九步都在那裡。下面這張表是**從本專案出發**的簡表,兩邊不一致時以根 README 為準。
+
 
 | 順序 | 做什麼 | 看哪份文件 | 需要 Kafka? |
 |---|---|---|---|
@@ -102,11 +106,21 @@ journalctl -u txf-producer -f
 `systemctl enable` 是**不需要的** —— 啟停由 crontab 控制,不靠開機自啟。
 
 ```cron
-40 08 * * 1-5 /bin/systemctl start txf-producer.service   # 日盤 08:45
+28 08 * * 1-5 /bin/systemctl start txf-producer.service   # 日盤 08:45(提早吃 08:30 試撮)
 46 13 * * 1-5 /bin/systemctl stop  txf-producer.service   # 日盤收 13:45
-55 14 * * 1-5 /bin/systemctl start txf-producer.service   # 夜盤 15:00
+48 14 * * 1-5 /bin/systemctl start txf-producer.service   # 夜盤 15:00(提早吃 14:50 試撮)
 01 05 * * 2-6 /bin/systemctl stop  txf-producer.service   # 夜盤收 05:00
 ```
+
+**啟動刻意比開盤早**(2026-07-26 起,原為 `08:40` / `14:55`):要吃 08:30–08:45 與
+14:50–15:00 的**試撮**,那是 Shioaji 歷史 API 完全沒有的資料。試撮只進 `txf-md-raw`
+—— protobuf 路徑仍過濾 `simtrade`,**看盤完全不受影響**。
+`check_feed_alive.sh` 的 `in_session()` 已排除那兩段,提早啟動不會造成誤報
+(副作用:試撮期的斷線健康檢查也看不到,要自己看資料)。
+
+> ⚠️ **這份 crontab 還沒進版控** —— 它是「試撮 tick 進不了湖」的必要條件之一,
+> 卻只活在生產機的 root crontab 裡。異動後請同步更新這裡與
+> [`infra/README.md`](../infra/README.md)。以實機 `crontab -l` 為最終依據。
 
 ### 🔴 重啟的代價不對稱
 
